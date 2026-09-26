@@ -1,0 +1,44 @@
+use serde_json::Value;
+use trustify_client::api::ClientLicenseExt;
+
+use crate::api::{ApiClient, ApiError, ListParams};
+
+pub async fn list(client: &ApiClient, params: &ListParams) -> Result<Value, ApiError> {
+    tracing::debug!(
+        operation = "license.list",
+        query = ?params.query,
+        limit = params.limit,
+        offset = params.offset,
+        sort = ?params.sort,
+        "Trustify API request"
+    );
+    let api = client.generated_api();
+    let query = params.query.clone();
+    let limit = params.limit;
+    let offset = params.offset;
+    let sort = params.sort.clone();
+
+    client
+        .send_with_refresh(move || {
+            let api = api.clone();
+            let query = query.clone();
+            let sort = sort.clone();
+            async move {
+                let mut request = api.list_licenses();
+                if let Some(query) = query {
+                    request = request.q(query);
+                }
+                if let Some(limit) = limit {
+                    request = request.limit(i64::from(limit));
+                }
+                if let Some(offset) = offset {
+                    request = request.offset(i64::from(offset));
+                }
+                if let Some(sort) = sort {
+                    request = request.sort(sort);
+                }
+                request.send().await
+            }
+        })
+        .await
+}

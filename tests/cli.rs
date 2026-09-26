@@ -39,6 +39,16 @@ fn sbom_summary(id: &str, name: &str) -> Value {
     })
 }
 
+fn assert_json_output(output: Output, expected: Value) {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout: Value = serde_json::from_slice(&output.stdout).expect("JSON output");
+    assert_eq!(stdout, expected);
+}
+
 struct TokenSequence(AtomicUsize);
 
 impl Respond for TokenSequence {
@@ -100,10 +110,257 @@ async fn sbom_list_sends_v3_query_and_bearer_token_and_prints_json() {
 }
 
 #[tokio::test]
+async fn vulnerability_list_uses_v3_endpoint_query_and_bearer_token() {
+    let server = MockServer::start().await;
+    let response = serde_json::json!({"items": [], "total": 0});
+
+    Mock::given(method("GET"))
+        .and(path("/api/v3/vulnerability"))
+        .and(query_param("q", "title~openssl"))
+        .and(query_param("limit", "10"))
+        .and(query_param("offset", "5"))
+        .and(query_param("sort", "id:desc"))
+        .and(header("authorization", "Bearer test-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = run_cli(
+        &server,
+        &[
+            "vuln",
+            "list",
+            "--query",
+            "title~openssl",
+            "--limit",
+            "10",
+            "--offset",
+            "5",
+            "--sort",
+            "id:desc",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_json_output(output, response);
+}
+
+#[tokio::test]
+async fn advisory_list_uses_v3_endpoint_and_query() {
+    let server = MockServer::start().await;
+    let response = serde_json::json!({"items": [], "total": 0});
+
+    Mock::given(method("GET"))
+        .and(path("/api/v3/advisory"))
+        .and(query_param("q", "title~kernel"))
+        .and(query_param("limit", "8"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = run_cli(
+        &server,
+        &[
+            "advisory",
+            "list",
+            "--query",
+            "title~kernel",
+            "--limit",
+            "8",
+        ],
+    );
+
+    assert_json_output(output, response);
+}
+
+#[tokio::test]
+async fn verbosity_and_debug_logs_go_to_stderr_without_contaminating_json_output() {
+    let server = MockServer::start().await;
+    let response = serde_json::json!({"items": [], "total": 0});
+
+    Mock::given(method("GET"))
+        .and(path("/api/v3/advisory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let verbose = run_cli(&server, &["advisory", "list", "-v"]);
+    assert!(
+        verbose.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verbose.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&verbose.stdout).expect("JSON stdout"),
+        response
+    );
+    let verbose_stderr = String::from_utf8_lossy(&verbose.stderr);
+    assert!(verbose_stderr.contains("starting trusty"));
+    assert!(!verbose_stderr.contains("test-token"));
+
+    let output = run_cli(&server, &["advisory", "list", "--debug"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout: Value = serde_json::from_slice(&output.stdout).expect("JSON stdout");
+    assert_eq!(stdout, response);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("starting trusty"));
+    assert!(stderr.contains("Trustify API response body"));
+    assert!(!stderr.contains("test-token"));
+}
+
+#[test]
+fn bare_noninteractive_invocation_prints_help_without_parsing_the_api_url() {
+    let output = Command::new(env!("CARGO_BIN_EXE_trusty"))
+        .args(["--url", "not a URL"])
+        .env_remove("TRUSTIFY_TOKEN")
+        .env_remove("ISSUER_URL")
+        .env_remove("CLIENT_ID")
+        .env_remove("CLIENT_SECRET")
+        .output()
+        .expect("run trusty without a subcommand");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Usage: trusty"));
+    assert!(stdout.contains("sbom"));
+}
+
+#[tokio::test]
+async fn license_list_uses_v3_endpoint_and_query() {
+    let server = MockServer::start().await;
+    let response = serde_json::json!({"items": [], "total": 0});
+
+    Mock::given(method("GET"))
+        .and(path("/api/v3/license"))
+        .and(query_param("q", "license~MIT"))
+        .and(query_param("offset", "3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = run_cli(
+        &server,
+        &[
+            "license",
+            "list",
+            "--query",
+            "license~MIT",
+            "--offset",
+            "3",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_json_output(output, response);
+}
+
+#[tokio::test]
+async fn package_search_uses_purl_endpoint() {
+    let server = MockServer::start().await;
+    let response = serde_json::json!({"items": [], "total": 0});
+
+    Mock::given(method("GET"))
+        .and(path("/api/v3/purl"))
+        .and(query_param("q", "name~openssl"))
+        .and(query_param("limit", "12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = run_cli(
+        &server,
+        &[
+            "package",
+            "search",
+            "--query",
+            "name~openssl",
+            "--limit",
+            "12",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_json_output(output, response);
+}
+
+#[tokio::test]
+async fn package_purl_alias_and_resource_get_commands_are_available() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/vulnerability/CVE-2024-1234"))
+        .and(query_param("scores", "true"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/advisory/advisory-123"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/purl/example-package"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let vuln = run_cli(
+        &server,
+        &[
+            "vuln",
+            "get",
+            "CVE-2024-1234",
+            "--scores",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(vuln.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&vuln.stderr).contains("HTTP 404"));
+
+    let advisory = run_cli(
+        &server,
+        &["advisory", "get", "advisory-123", "--format", "json"],
+    );
+    assert_eq!(advisory.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&advisory.stderr).contains("HTTP 404"));
+
+    let component = run_cli(
+        &server,
+        &["component", "get", "example-package", "--format", "json"],
+    );
+    assert_eq!(component.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&component.stderr).contains("HTTP 404"));
+}
+
+#[tokio::test]
 async fn forced_tui_requires_an_interactive_terminal() {
     let server = MockServer::start().await;
     let output = run_cli(&server, &["sbom", "list", "--format", "tui"]);
 
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires an interactive terminal"));
+
+    let output = run_cli(&server, &["vuln", "list", "--format", "tui"]);
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("requires an interactive terminal"));
 }
@@ -314,9 +571,17 @@ fn help_is_available_without_connection_configuration() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("sbom"));
+    assert!(stdout.contains("vuln"));
+    assert!(stdout.contains("advisory"));
+    assert!(stdout.contains("license"));
+    assert!(stdout.contains("package"));
+    assert!(stdout.contains("component"));
     assert!(stdout.contains("--url"));
     assert!(stdout.contains("[default: http://localhost:8080/api/v3]"));
     assert!(stdout.contains("--issuer-url"));
+    assert!(stdout.contains("--verbose"));
+    assert!(stdout.contains("--debug"));
+    assert!(stdout.contains("interactive entity menu"));
 }
 
 #[tokio::test]
