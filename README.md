@@ -57,6 +57,34 @@ reacquires a client-credentials token once if Trustify returns HTTP 401.
 
 Run `trusty --help` or `trusty sbom --help` for command options.
 
+## MCP server
+
+Run `trusty mcp` to expose Trustify's read-only operations as Model Context
+Protocol tools over stdio. MCP clients should launch `trusty` with `mcp` as its
+argument and provide the same `TRUSTIFY_URL` and authentication environment
+variables used by the CLI. For example:
+
+```json
+{
+  "mcpServers": {
+    "trusty": {
+      "command": "/path/to/trusty",
+      "args": ["mcp"],
+      "env": {
+        "TRUSTIFY_URL": "https://trustify.example/api/v3",
+        "TRUSTIFY_TOKEN": "your-token"
+      }
+    }
+  }
+}
+```
+
+The server provides `list_sboms`, `get_sbom`, `list_advisories`,
+`get_advisory`, `list_vulnerabilities`, `get_vulnerability`,
+`search_packages`, `get_package`, and `list_licenses`. List/search tools accept
+Trustify query expressions plus optional pagination and sorting arguments.
+Protocol messages use stdout; diagnostic logs remain on stderr.
+
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE) for details.

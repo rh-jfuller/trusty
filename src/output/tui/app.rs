@@ -1,12 +1,13 @@
 use crossterm::event::KeyCode;
 use serde_json::Value;
 
-use crate::api::sbom::ListParams;
+use crate::api::{sbom::ListParams, ListResource};
 
 pub struct App {
     pub items: Vec<Value>,
     pub title: String,
     pub item_title: String,
+    pub resource: Option<ListResource>,
     pub columns: Option<Vec<String>>,
     pub selected: usize,
     pub offset: u32,
@@ -35,7 +36,15 @@ pub enum Action {
 
 impl App {
     pub fn new(response: Value, params: ListParams, page_size: u32) -> anyhow::Result<Self> {
-        Self::from_response(response, params, page_size, "SBOMs", "SBOM", None)
+        Self::from_response(
+            response,
+            params,
+            page_size,
+            "SBOMs",
+            "SBOM",
+            Some(ListResource::Sbom),
+            None,
+        )
     }
 
     pub fn records(
@@ -43,14 +52,23 @@ impl App {
         params: ListParams,
         page_size: u32,
         title: &str,
+        resource: ListResource,
     ) -> anyhow::Result<Self> {
         let items = response
             .get("items")
             .and_then(Value::as_array)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Trustify resource list response has no items array"))?;
-        let columns = Some(record_columns(&items));
-        Self::from_response(response, params, page_size, title, title, columns)
+        let columns = Some(record_columns(&items, resource));
+        Self::from_response(
+            response,
+            params,
+            page_size,
+            title,
+            title,
+            Some(resource),
+            columns,
+        )
     }
 
     fn from_response(
@@ -59,6 +77,7 @@ impl App {
         page_size: u32,
         title: &str,
         item_title: &str,
+        resource: Option<ListResource>,
         columns: Option<Vec<String>>,
     ) -> anyhow::Result<Self> {
         let items = response
@@ -74,6 +93,7 @@ impl App {
             items,
             title: title.to_owned(),
             item_title: item_title.to_owned(),
+            resource,
             columns,
             selected: 0,
             offset,
@@ -86,10 +106,19 @@ impl App {
     }
 
     pub fn detail_as(title: &str, item: Value) -> Self {
+        let resource = match title.to_ascii_lowercase().as_str() {
+            "sbom" | "sboms" => Some(ListResource::Sbom),
+            "advisory" | "advisories" => Some(ListResource::Advisory),
+            "license" | "licenses" => Some(ListResource::License),
+            "package" | "packages" | "component" | "components" => Some(ListResource::Package),
+            "vulnerability" | "vulnerabilities" => Some(ListResource::Vulnerability),
+            _ => None,
+        };
         Self {
             items: Vec::new(),
             title: title.to_owned(),
             item_title: title.to_owned(),
+            resource,
             columns: None,
             selected: 0,
             offset: 0,
@@ -121,7 +150,9 @@ impl App {
 
         self.items = items;
         if self.columns.is_some() {
-            self.columns = Some(record_columns(&self.items));
+            if let Some(resource) = self.resource {
+                self.columns = Some(record_columns(&self.items, resource));
+            }
         }
         self.total = response.get("total").and_then(Value::as_u64);
         self.offset = offset;
@@ -204,25 +235,60 @@ impl App {
     }
 }
 
-fn record_columns(items: &[Value]) -> Vec<String> {
-    let Some(first) = items.first() else {
+fn record_columns(items: &[Value], resource: ListResource) -> Vec<String> {
+    let Some(object) = items.iter().find_map(Value::as_object) else {
+        if resource == ListResource::Vulnerability {
+            return ["id", "title", "severity", "score"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+        }
         return vec!["value".to_owned()];
     };
-    let Some(object) = first.as_object() else {
-        return vec!["value".to_owned()];
+    let contains_value = |field: &str| {
+        items
+            .iter()
+            .any(|item| item.get(field).is_some_and(|value| !value.is_null()))
     };
 
-    let identity = [
-        "id",
-        "uuid",
-        "identifier",
-        "document_id",
-        "purl",
-        "name",
-        "license",
-    ]
-    .iter()
-    .find(|field| object.get(**field).is_some_and(|value| !value.is_null()));
+    if resource == ListResource::Vulnerability {
+        let identity = ["id", "uuid", "identifier", "document_id"]
+            .iter()
+            .find(|field| contains_value(field))
+            .copied()
+            .unwrap_or("id");
+        let mut columns = vec![identity.to_owned(), "title".to_owned()];
+        columns.extend(
+            ["severity", "score"]
+                .into_iter()
+                .filter(|field| contains_value(field))
+                .map(str::to_owned),
+        );
+        return columns;
+    }
+
+    let identity_fields = if resource == ListResource::Advisory {
+        [
+            "document_id",
+            "uuid",
+            "id",
+            "identifier",
+            "purl",
+            "name",
+            "license",
+        ]
+    } else {
+        [
+            "id",
+            "uuid",
+            "identifier",
+            "document_id",
+            "purl",
+            "name",
+            "license",
+        ]
+    };
+    let identity = identity_fields.iter().find(|field| contains_value(field));
     let mut columns = identity
         .map(|field| vec![(*field).to_owned()])
         .unwrap_or_default();
@@ -242,9 +308,7 @@ fn record_columns(items: &[Value]) -> Vec<String> {
         if columns.len() == 5 {
             break;
         }
-        if !columns.iter().any(|column| column == field)
-            && object.get(field).is_some_and(|value| !value.is_null())
-        {
+        if !columns.iter().any(|column| column == field) && contains_value(field) {
             columns.push(field.to_owned());
         }
     }
@@ -323,6 +387,20 @@ mod tests {
     }
 
     #[test]
+    fn sbom_pages_keep_their_summary_table_layout() {
+        let mut app = app();
+
+        app.set_page(
+            serde_json::json!({"items": [{"id": "sbom-3", "name": "third"}], "total": 3}),
+            2,
+        )
+        .expect("valid SBOM page");
+
+        assert!(app.columns.is_none());
+        assert_eq!(app.resource, Some(ListResource::Sbom));
+    }
+
+    #[test]
     fn resource_rows_choose_useful_summary_columns() {
         let app = App::records(
             serde_json::json!({
@@ -338,6 +416,7 @@ mod tests {
             ListParams::default(),
             20,
             "Vulnerabilities",
+            ListResource::Vulnerability,
         )
         .expect("valid resource page");
 
@@ -354,15 +433,90 @@ mod tests {
     }
 
     #[test]
+    fn vulnerability_rows_keep_the_title_column_when_the_first_cve_has_no_title() {
+        let app = App::records(
+            serde_json::json!({
+                "items": [
+                    {"id": "CVE-2025-0001", "title": null, "severity": "high"},
+                    {"id": "CVE-2025-0002", "title": "Buffer overflow", "severity": "critical"}
+                ],
+                "total": 2
+            }),
+            ListParams::default(),
+            20,
+            "Vulnerabilities",
+            ListResource::Vulnerability,
+        )
+        .expect("valid vulnerability page");
+
+        assert_eq!(
+            app.columns,
+            Some(vec![
+                "id".to_owned(),
+                "title".to_owned(),
+                "severity".to_owned()
+            ])
+        );
+    }
+
+    #[test]
+    fn vulnerability_rows_always_reserve_a_title_column() {
+        let app = App::records(
+            serde_json::json!({"items": [{"id": "CVE-2025-0001", "severity": "high"}]}),
+            ListParams::default(),
+            20,
+            "Vulnerabilities",
+            ListResource::Vulnerability,
+        )
+        .expect("valid vulnerability page");
+
+        assert!(app
+            .columns
+            .as_ref()
+            .is_some_and(|columns| columns.iter().any(|column| column == "title")));
+    }
+
+    #[test]
+    fn advisory_rows_prioritize_document_id_over_uuid() {
+        let app = App::records(
+            serde_json::json!({
+                "items": [{
+                    "uuid": "urn:uuid:123e4567-e89b-12d3-a456-426614174000",
+                    "document_id": "GHSA-abcd-1234",
+                    "title": "Advisory title"
+                }]
+            }),
+            ListParams::default(),
+            20,
+            "Advisories",
+            ListResource::Advisory,
+        )
+        .expect("valid advisory page");
+
+        assert_eq!(
+            app.columns,
+            Some(vec!["document_id".to_owned(), "title".to_owned()])
+        );
+    }
+
+    #[test]
     fn scalar_resource_rows_have_a_value_column() {
         let app = App::records(
             serde_json::json!({"items": ["MIT", "Apache-2.0"]}),
             ListParams::default(),
             20,
             "Licenses",
+            ListResource::License,
         )
         .expect("valid scalar resource page");
 
         assert_eq!(app.columns, Some(vec!["value".to_owned()]));
+    }
+
+    #[test]
+    fn detail_pages_identify_the_entity_type() {
+        let app = App::detail_as("Advisory", serde_json::json!({"title": "Example"}));
+
+        assert_eq!(app.resource, Some(ListResource::Advisory));
     }
 }

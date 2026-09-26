@@ -1,5 +1,5 @@
 use serde_json::Value;
-use trustify_client::api::ClientAnalysisExt;
+use trustify_client::api::ClientPurlExt;
 
 use crate::api::{ApiClient, ApiError, ListParams};
 
@@ -24,7 +24,7 @@ pub async fn search(client: &ApiClient, params: &ListParams) -> Result<Value, Ap
             let query = query.clone();
             let sort = sort.clone();
             async move {
-                let mut request = api.search_component();
+                let mut request = api.list_purl();
                 if let Some(query) = query {
                     request = request.q(query);
                 }
@@ -52,7 +52,7 @@ pub async fn get(client: &ApiClient, key: &str) -> Result<Value, ApiError> {
         .send_with_refresh(move || {
             let api = api.clone();
             let key = key.clone();
-            async move { api.get_component().key(key).send().await }
+            async move { api.get_purl().key(key).send().await }
         })
         .await
 }

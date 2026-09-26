@@ -40,6 +40,7 @@ impl AccessTokenProvider for SharedTokenProvider {
     }
 }
 
+#[derive(Clone)]
 pub struct ApiClient {
     http: Client,
     client: TrustifyClient,

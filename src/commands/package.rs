@@ -7,7 +7,7 @@ use crate::{
 
 #[derive(Debug, Subcommand)]
 pub enum PackageCommands {
-    /// Search packages by name, Package URL, CPE, or Trustify query
+    /// Search fully-qualified Package URLs
     Search {
         #[command(flatten)]
         options: ListOptions,
@@ -16,9 +16,9 @@ pub enum PackageCommands {
         output: OutputOptions,
     },
 
-    /// Get package details by name, Package URL, or CPE
+    /// Get package details by Package URL or opaque PURL ID
     Get {
-        /// Package name, Package URL, or CPE
+        /// Package URL or opaque PURL ID
         key: String,
 
         #[command(flatten)]

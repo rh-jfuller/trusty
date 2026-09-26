@@ -1,5 +1,6 @@
 mod advisory;
 mod license;
+mod mcp;
 mod package;
 mod sbom;
 mod vulnerability;
@@ -132,6 +133,9 @@ pub enum Commands {
         #[command(subcommand)]
         command: package::PackageCommands,
     },
+
+    /// Run the Trusty MCP server over standard input/output
+    Mcp,
 }
 
 impl Commands {
@@ -142,6 +146,7 @@ impl Commands {
             Self::Advisory { command } => command.run(client).await,
             Self::License { command } => command.run(client).await,
             Self::Package { command } => command.run(client).await,
+            Self::Mcp => mcp::run(client.clone()).await,
         }
     }
 }

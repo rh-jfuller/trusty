@@ -270,12 +270,12 @@ async fn license_list_uses_v3_endpoint_and_query() {
 }
 
 #[tokio::test]
-async fn package_search_uses_component_endpoint() {
+async fn package_search_uses_purl_endpoint() {
     let server = MockServer::start().await;
     let response = serde_json::json!({"items": [], "total": 0});
 
     Mock::given(method("GET"))
-        .and(path("/api/v3/analysis/component"))
+        .and(path("/api/v3/purl"))
         .and(query_param("q", "name~openssl"))
         .and(query_param("limit", "12"))
         .respond_with(ResponseTemplate::new(200).set_body_json(&response))
@@ -301,7 +301,7 @@ async fn package_search_uses_component_endpoint() {
 }
 
 #[tokio::test]
-async fn package_component_alias_and_resource_get_commands_are_available() {
+async fn package_purl_alias_and_resource_get_commands_are_available() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/api/v3/vulnerability/CVE-2024-1234"))
@@ -317,7 +317,7 @@ async fn package_component_alias_and_resource_get_commands_are_available() {
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path("/api/v3/analysis/component/example-package"))
+        .and(path("/api/v3/purl/example-package"))
         .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
         .expect(1)
         .mount(&server)
