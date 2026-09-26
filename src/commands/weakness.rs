@@ -6,8 +6,8 @@ use crate::{
 };
 
 #[derive(Debug, Subcommand)]
-pub enum VulnerabilityCommands {
-    /// List vulnerabilities, optionally using Trustify's query syntax
+pub enum WeaknessCommands {
+    /// List weaknesses, optionally using Trustify's query syntax
     List {
         #[command(flatten)]
         options: ListOptions,
@@ -16,37 +16,33 @@ pub enum VulnerabilityCommands {
         output: OutputOptions,
     },
 
-    /// Get a vulnerability by ID
+    /// Get a weakness by its identifier, such as a CWE ID
     Get {
-        /// Vulnerability identifier, such as a CVE ID
+        /// Weakness identifier, such as a CWE ID
         id: String,
-
-        /// Include the full scores array from the contributing advisory
-        #[arg(long)]
-        scores: bool,
 
         #[command(flatten)]
         output: OutputOptions,
     },
 }
 
-impl VulnerabilityCommands {
+impl WeaknessCommands {
     pub async fn run(&self, client: &ApiClient) -> anyhow::Result<()> {
         match self {
             Self::List { options, output } => {
                 commands::list_resource(
                     client,
-                    ListResource::Vulnerability,
-                    "Vulnerabilities",
+                    ListResource::Weakness,
+                    "Weaknesses",
                     options,
                     output,
                 )
                 .await?;
             }
-            Self::Get { id, scores, output } => {
+            Self::Get { id, output } => {
                 let mode = output.format.resolve()?;
-                let response = api::vulnerability::get(client, id, *scores).await?;
-                commands::show_record(client, response, "Vulnerability", mode).await?;
+                let response = api::weakness::get(client, id).await?;
+                commands::show_record(client, response, "Weakness", mode).await?;
             }
         }
         Ok(())

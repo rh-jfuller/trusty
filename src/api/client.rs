@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::RwLock;
 use trustify_client::{
-    api::{ClientSbomExt, Error as TrustifyError, ResponseValue},
+    api::{ClientInfo, ClientSbomExt, Error as TrustifyError, ResponseValue},
     AccessTokenProvider, RetryPolicy, TrustifyClient,
 };
 
@@ -40,14 +40,50 @@ impl AccessTokenProvider for SharedTokenProvider {
     }
 }
 
+#[derive(Clone)]
 pub struct ApiClient {
     http: Client,
     client: TrustifyClient,
+    api_url: Url,
     token: Option<Arc<RwLock<Option<String>>>>,
     oauth: Option<OAuthCredentials>,
 }
 
 impl ApiClient {
+    pub fn configured_instance_label(url: &str) -> String {
+        let Ok(mut url) = Url::parse(url) else {
+            return "(invalid URL)".to_owned();
+        };
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return "(invalid URL)".to_owned();
+        }
+
+        let has_v3_api_root = url
+            .path_segments()
+            .map(|segments| {
+                let segments: Vec<_> = segments.filter(|segment| !segment.is_empty()).collect();
+                segments.ends_with(&["api", "v3"])
+            })
+            .unwrap_or(false);
+        if has_v3_api_root {
+            if let Ok(mut segments) = url.path_segments_mut() {
+                segments.pop_if_empty();
+                segments.pop();
+                segments.pop();
+            }
+        }
+
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url.set_query(None);
+        url.set_fragment(None);
+        url.to_string().trim_end_matches('/').to_owned()
+    }
+
+    pub fn instance_label(&self) -> String {
+        Self::configured_instance_label(self.api_url.as_str())
+    }
+
     pub async fn new(config: &Config) -> Result<Self, ApiError> {
         config
             .validate()
@@ -119,6 +155,8 @@ impl ApiClient {
             (None, None) => None,
         };
 
+        let api_url = base_url.clone();
+
         // Generated endpoint paths include `/api/v3`; pass the service root to
         // the bindings even when TRUSTIFY_URL already names the API root.
         let mut service_url = base_url;
@@ -145,6 +183,7 @@ impl ApiClient {
         Ok(Self {
             http,
             client,
+            api_url,
             token,
             oauth,
         })
@@ -157,6 +196,7 @@ impl ApiClient {
             limit = params.limit,
             offset = params.offset,
             sort = ?params.sort,
+            total = params.total,
             "Trustify API request"
         );
         let api = self.client.api().clone();
@@ -164,6 +204,7 @@ impl ApiClient {
         let limit = params.limit;
         let offset = params.offset;
         let sort = params.sort.clone();
+        let total = params.total;
 
         self.send_with_refresh(move || {
             let api = api.clone();
@@ -182,6 +223,9 @@ impl ApiClient {
                 }
                 if let Some(sort) = sort {
                     request = request.sort(sort);
+                }
+                if total {
+                    request = request.total(true);
                 }
                 request.send().await
             }
@@ -204,6 +248,81 @@ impl ApiClient {
 
     pub(crate) fn generated_api(&self) -> trustify_client::api::Client {
         self.client.api().clone()
+    }
+
+    pub(crate) async fn raw_api_get(
+        &self,
+        operation: &'static str,
+        path: &[&str],
+        query: &[(&str, String)],
+    ) -> Result<Value, ApiError> {
+        let mut url = self.api_url.clone();
+        {
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                ApiError::InvalidConfiguration("API URL cannot be used as a base URL".to_owned())
+            })?;
+            segments.pop_if_empty();
+            segments.extend(path);
+        }
+
+        let mut token_refreshed = false;
+        loop {
+            let started = Instant::now();
+            tracing::trace!(operation, "sending raw Trustify API request");
+            let mut request = self
+                .http
+                .get(url.clone())
+                .header("api-version", trustify_client::api::Client::api_version())
+                .query(query);
+            if let Some(token_state) = &self.token {
+                if let Some(token) = token_state.read().await.as_ref() {
+                    request = request.bearer_auth(token);
+                }
+            }
+
+            let response = request.send().await?;
+            if response.status() == StatusCode::UNAUTHORIZED && !token_refreshed {
+                if let Some(oauth) = &self.oauth {
+                    tracing::warn!(
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "Trustify rejected the access token; refreshing OAuth credentials"
+                    );
+                    token_refreshed = true;
+                    let token = get_token(&self.http, oauth).await?;
+                    if let Some(token_state) = &self.token {
+                        *token_state.write().await = Some(token);
+                    }
+                    continue;
+                }
+            }
+
+            let status = response.status();
+            let body = response.bytes().await?;
+            tracing::trace!(
+                operation,
+                http_status = status.as_u16(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "raw Trustify API response received"
+            );
+            if !status.is_success() {
+                tracing::debug!(
+                    operation,
+                    status = status.as_u16(),
+                    "Trustify API request failed"
+                );
+                return Err(ApiError::HttpStatus {
+                    status,
+                    body: String::from_utf8_lossy(&body).into_owned(),
+                });
+            }
+
+            let value: Value = serde_json::from_slice(&body)?;
+            if crate::logging::full_diagnostics_enabled() {
+                let redacted = crate::logging::redact_sensitive_fields(&value);
+                tracing::trace!(response = %redacted, "Trustify API response body");
+            }
+            return Ok(value);
+        }
     }
 
     pub(crate) async fn send_with_refresh<T, F, Fut>(&self, mut send: F) -> Result<Value, ApiError>
@@ -447,4 +566,27 @@ async fn get_token(http: &Client, oauth: &OAuthCredentials) -> Result<String, Ap
     }
 
     Ok(access_token.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiClient;
+
+    #[test]
+    fn instance_label_shows_the_service_root_without_credentials() {
+        assert_eq!(
+            ApiClient::configured_instance_label(
+                "https://user:secret@trustify.example/tenant/api/v3"
+            ),
+            "https://trustify.example/tenant"
+        );
+        assert_eq!(
+            ApiClient::configured_instance_label("http://localhost:8080/api/v3"),
+            "http://localhost:8080"
+        );
+        assert_eq!(
+            ApiClient::configured_instance_label("not a URL"),
+            "(invalid URL)"
+        );
+    }
 }

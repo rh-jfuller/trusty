@@ -1,5 +1,5 @@
 use serde_json::Value;
-use trustify_client::api::ClientAnalysisExt;
+use trustify_client::api::ClientPurlExt;
 
 use crate::api::{ApiClient, ApiError, ListParams};
 
@@ -10,6 +10,7 @@ pub async fn search(client: &ApiClient, params: &ListParams) -> Result<Value, Ap
         limit = params.limit,
         offset = params.offset,
         sort = ?params.sort,
+        total = params.total,
         "Trustify API request"
     );
     let api = client.generated_api();
@@ -17,6 +18,7 @@ pub async fn search(client: &ApiClient, params: &ListParams) -> Result<Value, Ap
     let limit = params.limit;
     let offset = params.offset;
     let sort = params.sort.clone();
+    let total = params.total;
 
     client
         .send_with_refresh(move || {
@@ -24,7 +26,7 @@ pub async fn search(client: &ApiClient, params: &ListParams) -> Result<Value, Ap
             let query = query.clone();
             let sort = sort.clone();
             async move {
-                let mut request = api.search_component();
+                let mut request = api.list_purl();
                 if let Some(query) = query {
                     request = request.q(query);
                 }
@@ -36,6 +38,9 @@ pub async fn search(client: &ApiClient, params: &ListParams) -> Result<Value, Ap
                 }
                 if let Some(sort) = sort {
                     request = request.sort(sort);
+                }
+                if total {
+                    request = request.total(true);
                 }
                 request.send().await
             }
@@ -52,7 +57,7 @@ pub async fn get(client: &ApiClient, key: &str) -> Result<Value, ApiError> {
         .send_with_refresh(move || {
             let api = api.clone();
             let key = key.clone();
-            async move { api.get_component().key(key).send().await }
+            async move { api.get_purl().key(key).send().await }
         })
         .await
 }

@@ -42,7 +42,7 @@ impl AdvisoryCommands {
             Self::Get { key, output } => {
                 let mode = output.format.resolve()?;
                 let response = api::advisory::get(client, key).await?;
-                commands::show_record(response, "Advisory", mode).await?;
+                commands::show_record(client, response, "Advisory", mode).await?;
             }
         }
         Ok(())

@@ -32,16 +32,16 @@ pub async fn run() -> anyhow::Result<ExitCode> {
 }
 
 async fn run_entity_menu(config: &Config) -> anyhow::Result<()> {
-    let mut client = None;
+    let client = ApiClient::new(config).await?;
+    let counts = output::tui::EntityCountCache::default();
     let mut selected = 0;
-    while let Some((resource, new_selection)) = output::tui::main_menu(selected).await? {
+    let mut theme = output::tui::ThemeMode::default();
+    let instance_label = ApiClient::configured_instance_label(&config.url);
+    while let Some((resource, new_selection)) =
+        output::tui::main_menu(selected, &instance_label, &client, &counts, &mut theme).await?
+    {
         selected = new_selection;
-        if client.is_none() {
-            client = Some(ApiClient::new(config).await?);
-        }
-        if let Some(client) = &client {
-            commands::run_entity_list(client, resource).await?;
-        }
+        commands::run_entity_list(&client, resource, &counts, theme).await?;
     }
     Ok(())
 }

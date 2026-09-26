@@ -55,6 +55,7 @@ impl SbomCommands {
                     limit: *limit,
                     offset: *offset,
                     sort: sort.clone(),
+                    total: mode == OutputMode::Tui,
                 };
                 match mode {
                     OutputMode::Json => {
@@ -68,7 +69,13 @@ impl SbomCommands {
                             ..params
                         };
                         let response = sbom_api::list(client, &params).await?;
-                        output::tui::browse_sboms(client, params, response).await?;
+                        output::tui::browse_sboms(
+                            client,
+                            params,
+                            response,
+                            output::tui::ThemeMode::default(),
+                        )
+                        .await?;
                     }
                 }
                 Ok(())
@@ -78,7 +85,15 @@ impl SbomCommands {
                 let response = sbom_api::get(client, id).await?;
                 match mode {
                     OutputMode::Json => output::print_json(&response)?,
-                    OutputMode::Tui => output::tui::show_detail(response).await?,
+                    OutputMode::Tui => {
+                        output::tui::show_detail_as_on(
+                            "SBOM",
+                            response,
+                            &client.instance_label(),
+                            client,
+                        )
+                        .await?
+                    }
                 }
                 Ok(())
             }
