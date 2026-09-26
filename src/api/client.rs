@@ -1,13 +1,20 @@
-use std::time::Duration;
+use std::{future::Future, sync::Arc, time::Duration};
 
 use reqwest::{Client, StatusCode, Url};
+use serde::Serialize;
 use serde_json::Value;
-use tokio::{sync::RwLock, time::sleep};
+use tokio::sync::RwLock;
+use trustify_client::{
+    api::{ClientSbomExt, Error as TrustifyError, ResponseValue},
+    AccessTokenProvider, RetryPolicy, TrustifyClient,
+};
 
-use crate::{api::ApiError, config::Config};
+use crate::{
+    api::{sbom::ListParams, ApiError},
+    config::Config,
+};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Copy)]
 enum TokenEndpointAuthMethod {
@@ -15,6 +22,7 @@ enum TokenEndpointAuthMethod {
     ClientSecretPost,
 }
 
+#[derive(Clone)]
 struct OAuthCredentials {
     token_endpoint: Url,
     auth_method: TokenEndpointAuthMethod,
@@ -22,10 +30,20 @@ struct OAuthCredentials {
     client_secret: String,
 }
 
+#[derive(Clone)]
+struct SharedTokenProvider(Arc<RwLock<Option<String>>>);
+
+#[async_trait::async_trait]
+impl AccessTokenProvider for SharedTokenProvider {
+    async fn access_token(&self) -> Result<Option<String>, String> {
+        Ok(self.0.read().await.clone())
+    }
+}
+
 pub struct ApiClient {
     http: Client,
-    base_url: Url,
-    token: RwLock<Option<String>>,
+    client: TrustifyClient,
+    token: Option<Arc<RwLock<Option<String>>>>,
     oauth: Option<OAuthCredentials>,
 }
 
@@ -85,87 +103,131 @@ impl ApiClient {
             (None, None) => None,
         };
 
+        // Generated endpoint paths include `/api/v3`; pass the service root to
+        // the bindings even when TRUSTIFY_URL already names the API root.
+        let mut service_url = base_url;
+        {
+            let mut segments = service_url.path_segments_mut().map_err(|_| {
+                ApiError::InvalidConfiguration("API URL cannot be used as a base URL".to_owned())
+            })?;
+            segments.pop_if_empty();
+            segments.pop();
+            segments.pop();
+        }
+
+        let token = token.map(|token| Arc::new(RwLock::new(Some(token))));
+        let mut client_builder = TrustifyClient::builder(service_url.as_str())
+            .request_timeout(REQUEST_TIMEOUT)
+            .retry_policy(RetryPolicy::for_idempotent_requests(2));
+        if let Some(token) = &token {
+            client_builder = client_builder.token_provider(SharedTokenProvider(token.clone()));
+        }
+        let client = client_builder
+            .build()
+            .map_err(|error| ApiError::InvalidConfiguration(error.to_string()))?;
+
         Ok(Self {
             http,
-            base_url,
-            token: RwLock::new(token),
+            client,
+            token,
             oauth,
         })
     }
 
-    pub async fn get_json(
-        &self,
-        path_segments: &[&str],
-        query: &[(String, String)],
-    ) -> Result<Value, ApiError> {
-        let url = self.api_url(path_segments)?;
-        let mut attempt = 0;
+    pub async fn list_sboms(&self, params: &ListParams) -> Result<Value, ApiError> {
+        let api = self.client.api().clone();
+        let query = params.query.clone();
+        let limit = params.limit;
+        let offset = params.offset;
+        let sort = params.sort.clone();
+
+        self.send_with_refresh(move || {
+            let api = api.clone();
+            let query = query.clone();
+            let sort = sort.clone();
+            async move {
+                let mut request = api.list_sboms();
+                if let Some(query) = query {
+                    request = request.q(query);
+                }
+                if let Some(limit) = limit {
+                    request = request.limit(i64::from(limit));
+                }
+                if let Some(offset) = offset {
+                    request = request.offset(i64::from(offset));
+                }
+                if let Some(sort) = sort {
+                    request = request.sort(sort);
+                }
+                request.send().await
+            }
+        })
+        .await
+    }
+
+    pub async fn get_sbom(&self, id: &str) -> Result<Value, ApiError> {
+        let api = self.client.api().clone();
+        let id = id.to_owned();
+
+        self.send_with_refresh(move || {
+            let api = api.clone();
+            let id = id.clone();
+            async move { api.get_sbom().id(id).send().await }
+        })
+        .await
+    }
+
+    async fn send_with_refresh<T, F, Fut>(&self, mut send: F) -> Result<Value, ApiError>
+    where
+        T: Serialize,
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<ResponseValue<T>, TrustifyError<()>>>,
+    {
         let mut token_refreshed = false;
-
         loop {
-            let token = self.token.read().await.clone();
-            let mut request = self.http.get(url.clone()).query(query);
-            if let Some(token) = token {
-                request = request.bearer_auth(token);
-            }
-
-            match request.send().await {
+            match send().await {
+                Ok(response) => return Ok(serde_json::to_value(response.into_inner())?),
                 Err(error)
-                    if attempt + 1 < MAX_ATTEMPTS && (error.is_timeout() || error.is_connect()) =>
+                    if trustify_error_status(&error) == Some(StatusCode::UNAUTHORIZED.as_u16())
+                        && !token_refreshed
+                        && self.oauth.is_some() =>
                 {
-                    attempt += 1;
-                    sleep(retry_delay(attempt)).await;
+                    token_refreshed = true;
+                    let token =
+                        get_token(&self.http, self.oauth.as_ref().expect("checked above")).await?;
+                    if let Some(token_state) = &self.token {
+                        *token_state.write().await = Some(token);
+                    }
                 }
-                Err(error) => return Err(ApiError::Request(error)),
-                Ok(response) => {
-                    if response.status() == StatusCode::UNAUTHORIZED && !token_refreshed {
-                        if let Some(oauth) = &self.oauth {
-                            token_refreshed = true;
-                            let token = get_token(&self.http, oauth).await?;
-                            *self.token.write().await = Some(token);
-                            continue;
-                        }
-                    }
-
-                    if attempt + 1 < MAX_ATTEMPTS && is_retryable(response.status()) {
-                        attempt += 1;
-                        sleep(retry_delay(attempt)).await;
-                        continue;
-                    }
-
-                    let status = response.status();
-                    let body = response.bytes().await?;
-                    if !status.is_success() {
-                        return Err(ApiError::HttpStatus {
-                            status,
-                            body: String::from_utf8_lossy(&body).into_owned(),
-                        });
-                    }
-                    return Ok(serde_json::from_slice(&body)?);
-                }
+                Err(error) => return Err(trustify_error(error).await),
             }
         }
     }
+}
 
-    fn api_url(&self, path_segments: &[&str]) -> Result<Url, ApiError> {
-        let mut url = self.base_url.clone();
-        {
-            let mut segments = url.path_segments_mut().map_err(|_| {
-                ApiError::InvalidConfiguration("API URL cannot be used as a base URL".to_owned())
-            })?;
-            segments.pop_if_empty();
-            segments.extend(path_segments.iter().copied());
-        }
-        Ok(url)
+fn trustify_error_status(error: &TrustifyError<()>) -> Option<u16> {
+    match error {
+        TrustifyError::ErrorResponse(response) => Some(response.status().as_u16()),
+        TrustifyError::UnexpectedResponse(response) => Some(response.status().as_u16()),
+        _ => None,
     }
 }
 
-fn is_retryable(status: StatusCode) -> bool {
-    status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS
-}
-
-fn retry_delay(attempt: usize) -> Duration {
-    Duration::from_millis(100 * attempt as u64)
+async fn trustify_error(error: TrustifyError<()>) -> ApiError {
+    match error {
+        TrustifyError::ErrorResponse(response) => ApiError::HttpStatus {
+            status: StatusCode::from_u16(response.status().as_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            body: String::new(),
+        },
+        TrustifyError::UnexpectedResponse(response) => {
+            let status = StatusCode::from_u16(response.status().as_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let body = response.text().await.unwrap_or_default();
+            ApiError::HttpStatus { status, body }
+        }
+        error => ApiError::Client(error.to_string()),
+    }
 }
 
 async fn discover_token_endpoint(

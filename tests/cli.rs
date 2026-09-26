@@ -20,6 +20,25 @@ fn run_cli(server: &MockServer, args: &[&str]) -> Output {
         .expect("run trusty")
 }
 
+fn sbom_summary(id: &str, name: &str) -> Value {
+    serde_json::json!({
+        "authors": [],
+        "data_licenses": [],
+        "described_by": [],
+        "id": id,
+        "ingested": "2024-01-01T00:00:00Z",
+        "labels": {},
+        "name": name,
+        "number_of_packages": 0,
+        "published": null,
+        "sha256": "sha256",
+        "sha384": "sha384",
+        "sha512": "sha512",
+        "size": 0,
+        "suppliers": []
+    })
+}
+
 struct TokenSequence(AtomicUsize);
 
 impl Respond for TokenSequence {
@@ -39,7 +58,7 @@ impl Respond for TokenSequence {
 #[tokio::test]
 async fn sbom_list_sends_v3_query_and_bearer_token_and_prints_json() {
     let server = MockServer::start().await;
-    let response = serde_json::json!({"items": [{"id": "sbom-1"}], "total": 1});
+    let response = serde_json::json!({"items": [sbom_summary("sbom-1", "fixture")], "total": 1});
 
     Mock::given(method("GET"))
         .and(path("/api/v3/sbom"))
@@ -66,6 +85,8 @@ async fn sbom_list_sends_v3_query_and_bearer_token_and_prints_json() {
             "10",
             "--sort",
             "ingested:desc",
+            "--format",
+            "json",
         ],
     );
 
@@ -79,10 +100,19 @@ async fn sbom_list_sends_v3_query_and_bearer_token_and_prints_json() {
 }
 
 #[tokio::test]
+async fn forced_tui_requires_an_interactive_terminal() {
+    let server = MockServer::start().await;
+    let output = run_cli(&server, &["sbom", "list", "--format", "tui"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires an interactive terminal"));
+}
+
+#[tokio::test]
 async fn sbom_get_uses_v3_detail_endpoint_and_preserves_response() {
     let server = MockServer::start().await;
     let id = "urn:uuid:123e4567-e89b-12d3-a456-426614174000";
-    let response = serde_json::json!({"id": id, "name": "fixture"});
+    let response = sbom_summary(id, "fixture");
 
     Mock::given(method("GET"))
         .and(path(format!("/api/v3/sbom/{id}")))
@@ -175,6 +205,8 @@ async fn oauth_client_credentials_fetches_and_uses_access_token() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let stdout: Value = serde_json::from_slice(&output.stdout).expect("automatic JSON output");
+    assert_eq!(stdout["total"], 0);
 }
 
 #[tokio::test]
@@ -239,6 +271,8 @@ async fn oauth_client_credentials_are_refetched_after_api_unauthorized() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let stdout: Value = serde_json::from_slice(&output.stdout).expect("automatic JSON output");
+    assert_eq!(stdout["total"], 0);
 }
 
 #[tokio::test]

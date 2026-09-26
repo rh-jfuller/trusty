@@ -8,6 +8,9 @@ pub enum ApiError {
     #[error("HTTP request failed: {0}")]
     Request(#[from] reqwest::Error),
 
+    #[error("Trustify client request failed: {0}")]
+    Client(String),
+
     #[error("authentication failed with HTTP {status}: {body}")]
     Authentication { status: StatusCode, body: String },
 

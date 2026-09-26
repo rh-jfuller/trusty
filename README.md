@@ -14,8 +14,16 @@ pass `--url` to connect to another instance. Both a service root (for example,
 export TRUSTIFY_URL=https://trustify.example
 trusty sbom list --limit 20
 trusty sbom list --query 'name~openssl' --sort 'ingested:desc'
+trusty sbom list --limit 20 --format json
 trusty sbom get SBOM_ID
 ```
+
+In an interactive terminal, `sbom list` opens a pageable browser: `j`/`k` or
+arrow keys move, Enter opens the selected SBOM, `/` searches, `n`/`p` change
+pages, and `q` exits. When stdout or stdin is piped, output defaults to raw JSON;
+`--format json` always selects that mode, and `--format tui` forces the browser
+when attached to a terminal. The list columns are ID, name, published date,
+package count, and suppliers.
 
 Use `--token` or `TRUSTIFY_TOKEN` for a static bearer token. For OIDC
 client-credentials authentication, set `ISSUER_URL`, `CLIENT_ID`, and
@@ -23,7 +31,6 @@ client-credentials authentication, set `ISSUER_URL`, `CLIENT_ID`, and
 CLI reads the issuer's `.well-known/openid-configuration` metadata to locate
 the token endpoint, uses its advertised client authentication method, and
 reacquires a client-credentials token once if Trustify returns HTTP 401.
-List/get responses are written as JSON to stdout.
 
 Run `trusty --help` or `trusty sbom --help` for command options.
 

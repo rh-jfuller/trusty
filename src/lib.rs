@@ -2,6 +2,7 @@ pub mod api;
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod output;
 
 use clap::Parser;
 use std::process::ExitCode;
