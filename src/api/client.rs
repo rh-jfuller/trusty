@@ -1,4 +1,4 @@
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration, time::Instant};
 
 use reqwest::{Client, StatusCode, Url};
 use serde::Serialize;
@@ -83,6 +83,22 @@ impl ApiClient {
             segments.extend(["api", "v3"]);
         }
 
+        let authentication = if config.token.is_some() {
+            "bearer token"
+        } else if config.client_id.is_some() {
+            "OAuth2 client credentials"
+        } else {
+            "none"
+        };
+        tracing::info!(
+            scheme = base_url.scheme(),
+            host = base_url.host_str().unwrap_or_default(),
+            port = ?base_url.port(),
+            path = base_url.path(),
+            "configuring Trustify API client"
+        );
+        tracing::debug!(authentication, "selected authentication method");
+
         let http = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
         let oauth = match (&config.issuer_url, &config.client_id, &config.client_secret) {
             (Some(issuer_url), Some(client_id), Some(client_secret)) => {
@@ -135,6 +151,14 @@ impl ApiClient {
     }
 
     pub async fn list_sboms(&self, params: &ListParams) -> Result<Value, ApiError> {
+        tracing::debug!(
+            operation = "sbom.list",
+            query = ?params.query,
+            limit = params.limit,
+            offset = params.offset,
+            sort = ?params.sort,
+            "Trustify API request"
+        );
         let api = self.client.api().clone();
         let query = params.query.clone();
         let limit = params.limit;
@@ -166,6 +190,7 @@ impl ApiClient {
     }
 
     pub async fn get_sbom(&self, id: &str) -> Result<Value, ApiError> {
+        tracing::debug!(operation = "sbom.get", id, "Trustify API request");
         let api = self.client.api().clone();
         let id = id.to_owned();
 
@@ -177,7 +202,11 @@ impl ApiClient {
         .await
     }
 
-    async fn send_with_refresh<T, F, Fut>(&self, mut send: F) -> Result<Value, ApiError>
+    pub(crate) fn generated_api(&self) -> trustify_client::api::Client {
+        self.client.api().clone()
+    }
+
+    pub(crate) async fn send_with_refresh<T, F, Fut>(&self, mut send: F) -> Result<Value, ApiError>
     where
         T: Serialize,
         F: FnMut() -> Fut,
@@ -185,13 +214,30 @@ impl ApiClient {
     {
         let mut token_refreshed = false;
         loop {
+            let started = Instant::now();
+            tracing::trace!("sending generated Trustify API request");
             match send().await {
-                Ok(response) => return Ok(serde_json::to_value(response.into_inner())?),
+                Ok(response) => {
+                    let value = serde_json::to_value(response.into_inner())?;
+                    tracing::trace!(
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "Trustify API request succeeded"
+                    );
+                    if crate::logging::full_diagnostics_enabled() {
+                        let redacted = crate::logging::redact_sensitive_fields(&value);
+                        tracing::trace!(response = %redacted, "Trustify API response body");
+                    }
+                    return Ok(value);
+                }
                 Err(error)
                     if trustify_error_status(&error) == Some(StatusCode::UNAUTHORIZED.as_u16())
                         && !token_refreshed
                         && self.oauth.is_some() =>
                 {
+                    tracing::warn!(
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "Trustify rejected the access token; refreshing OAuth credentials"
+                    );
                     token_refreshed = true;
                     let token =
                         get_token(&self.http, self.oauth.as_ref().expect("checked above")).await?;
@@ -199,7 +245,15 @@ impl ApiClient {
                         *token_state.write().await = Some(token);
                     }
                 }
-                Err(error) => return Err(trustify_error(error).await),
+                Err(error) => {
+                    tracing::debug!(
+                        status = ?trustify_error_status(&error),
+                        error_category = trustify_error_category(&error),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "Trustify API request failed"
+                    );
+                    return Err(trustify_error(error).await);
+                }
             }
         }
     }
@@ -210,6 +264,14 @@ fn trustify_error_status(error: &TrustifyError<()>) -> Option<u16> {
         TrustifyError::ErrorResponse(response) => Some(response.status().as_u16()),
         TrustifyError::UnexpectedResponse(response) => Some(response.status().as_u16()),
         _ => None,
+    }
+}
+
+fn trustify_error_category(error: &TrustifyError<()>) -> &'static str {
+    match error {
+        TrustifyError::ErrorResponse(_) => "http_error_response",
+        TrustifyError::UnexpectedResponse(_) => "unexpected_response",
+        _ => "client_error",
     }
 }
 
@@ -234,6 +296,7 @@ async fn discover_token_endpoint(
     http: &Client,
     issuer_url: &str,
 ) -> Result<(Url, TokenEndpointAuthMethod), ApiError> {
+    tracing::debug!("discovering OAuth2 token endpoint");
     let issuer = Url::parse(issuer_url)
         .map_err(|error| ApiError::Oidc(format!("invalid issuer URL: {error}")))?;
     validate_http_url(&issuer, "issuer URL")?;
@@ -332,6 +395,14 @@ fn validate_http_url(url: &Url, description: &str) -> Result<(), ApiError> {
 }
 
 async fn get_token(http: &Client, oauth: &OAuthCredentials) -> Result<String, ApiError> {
+    tracing::info!("requesting OAuth2 client-credentials token");
+    tracing::debug!(
+        auth_method = match oauth.auth_method {
+            TokenEndpointAuthMethod::ClientSecretBasic => "client_secret_basic",
+            TokenEndpointAuthMethod::ClientSecretPost => "client_secret_post",
+        },
+        "authenticating OAuth2 token request"
+    );
     let request = http.post(oauth.token_endpoint.clone());
     let request = match oauth.auth_method {
         TokenEndpointAuthMethod::ClientSecretBasic => request
@@ -346,6 +417,10 @@ async fn get_token(http: &Client, oauth: &OAuthCredentials) -> Result<String, Ap
     let response = request.send().await?;
 
     let status = response.status();
+    tracing::trace!(
+        http_status = status.as_u16(),
+        "OAuth2 token endpoint responded"
+    );
     let body = response.bytes().await?;
     if !status.is_success() {
         return Err(ApiError::Authentication {

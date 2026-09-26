@@ -27,43 +27,73 @@ fn render_list(frame: &mut Frame<'_>, app: &App) {
         .split(frame.area());
 
     let title = if let Some(query) = &app.params.query {
-        format!("SBOMs · {query}")
+        format!("{} · {query}", app.title)
     } else {
-        "SBOMs".to_owned()
+        app.title.clone()
     };
     frame.render_widget(
         Paragraph::new(title).block(Block::default().borders(Borders::ALL)),
         layout[0],
     );
 
-    let header = Row::new(["ID", "NAME", "PUBLISHED", "PACKAGES", "SUPPLIERS"]).style(
+    let (headers, rows, widths) = if let Some(columns) = &app.columns {
+        let headers = columns
+            .iter()
+            .map(|column| column_label(column))
+            .collect::<Vec<_>>();
+        let rows = app
+            .items
+            .iter()
+            .map(|item| {
+                Row::new(
+                    columns
+                        .iter()
+                        .map(|column| Cell::from(record_value(item, column)))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let widths = vec![Constraint::Min(12); columns.len()];
+        (headers, rows, widths)
+    } else {
+        let rows = app
+            .items
+            .iter()
+            .map(|item| {
+                Row::new([
+                    Cell::from(short_id(sbom_id(item).unwrap_or("—"))),
+                    Cell::from(first_value(item, &["name", "document_id"])),
+                    Cell::from(value_text(item.get("published"))),
+                    Cell::from(value_text(item.get("number_of_packages"))),
+                    Cell::from(value_text(item.get("suppliers"))),
+                ])
+            })
+            .collect::<Vec<_>>();
+        (
+            ["ID", "NAME", "PUBLISHED", "PACKAGES", "SUPPLIERS"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            rows,
+            vec![
+                Constraint::Length(13),
+                Constraint::Min(18),
+                Constraint::Length(21),
+                Constraint::Length(10),
+                Constraint::Min(16),
+            ],
+        )
+    };
+    let header = Row::new(headers).style(
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     );
-    let rows = app.items.iter().map(|item| {
-        Row::new([
-            Cell::from(short_id(sbom_id(item).unwrap_or("—"))),
-            Cell::from(first_value(item, &["name", "document_id"])),
-            Cell::from(value_text(item.get("published"))),
-            Cell::from(value_text(item.get("number_of_packages"))),
-            Cell::from(value_text(item.get("suppliers"))),
-        ])
-    });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(13),
-            Constraint::Min(18),
-            Constraint::Length(21),
-            Constraint::Length(10),
-            Constraint::Min(16),
-        ],
-    )
-    .header(header)
-    .block(Block::default().borders(Borders::ALL))
-    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-    .highlight_symbol("› ");
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL))
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("› ");
     let mut state = TableState::default();
     state.select((!app.items.is_empty()).then_some(app.selected));
     frame.render_stateful_widget(table, layout[1], &mut state);
@@ -89,8 +119,8 @@ fn render_list(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn render_detail(frame: &mut Frame<'_>, item: &Value, scroll: u16, app: &App) {
-    let id = sbom_id(item).unwrap_or("SBOM detail");
-    let title = format!("SBOM · {id}");
+    let id = record_id(item).unwrap_or("details");
+    let title = format!("{} · {id}", app.item_title);
     let json = serde_json::to_string_pretty(item).unwrap_or_else(|_| item.to_string());
     let lines = json.lines().map(Line::from).collect::<Vec<_>>();
     let layout = Layout::default()
@@ -118,6 +148,32 @@ fn sbom_id(item: &Value) -> Option<&str> {
     item.get("id")
         .or_else(|| item.get("uuid"))
         .and_then(Value::as_str)
+}
+
+fn record_id(item: &Value) -> Option<&str> {
+    [
+        "id",
+        "uuid",
+        "identifier",
+        "document_id",
+        "purl",
+        "name",
+        "license",
+    ]
+    .iter()
+    .find_map(|field| item.get(*field).and_then(Value::as_str))
+}
+
+fn column_label(column: &str) -> String {
+    column.replace('_', " ").to_uppercase()
+}
+
+fn record_value(item: &Value, column: &str) -> String {
+    if column == "value" && !item.is_object() {
+        value_text(Some(item))
+    } else {
+        value_text(item.get(column))
+    }
 }
 
 fn first_value(item: &Value, fields: &[&str]) -> String {

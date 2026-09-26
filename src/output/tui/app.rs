@@ -5,6 +5,9 @@ use crate::api::sbom::ListParams;
 
 pub struct App {
     pub items: Vec<Value>,
+    pub title: String,
+    pub item_title: String,
+    pub columns: Option<Vec<String>>,
     pub selected: usize,
     pub offset: u32,
     pub page_size: u32,
@@ -31,18 +34,47 @@ pub enum Action {
 }
 
 impl App {
-    pub fn new(response: Value, mut params: ListParams, page_size: u32) -> anyhow::Result<Self> {
+    pub fn new(response: Value, params: ListParams, page_size: u32) -> anyhow::Result<Self> {
+        Self::from_response(response, params, page_size, "SBOMs", "SBOM", None)
+    }
+
+    pub fn records(
+        response: Value,
+        params: ListParams,
+        page_size: u32,
+        title: &str,
+    ) -> anyhow::Result<Self> {
         let items = response
             .get("items")
             .and_then(Value::as_array)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Trustify SBOM list response has no items array"))?;
+            .ok_or_else(|| anyhow::anyhow!("Trustify resource list response has no items array"))?;
+        let columns = Some(record_columns(&items));
+        Self::from_response(response, params, page_size, title, title, columns)
+    }
+
+    fn from_response(
+        response: Value,
+        mut params: ListParams,
+        page_size: u32,
+        title: &str,
+        item_title: &str,
+        columns: Option<Vec<String>>,
+    ) -> anyhow::Result<Self> {
+        let items = response
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Trustify list response has no items array"))?;
         let offset = params.offset.unwrap_or_default();
         params.limit = Some(page_size);
 
         Ok(Self {
             total: response.get("total").and_then(Value::as_u64),
             items,
+            title: title.to_owned(),
+            item_title: item_title.to_owned(),
+            columns,
             selected: 0,
             offset,
             page_size,
@@ -53,9 +85,12 @@ impl App {
         })
     }
 
-    pub fn detail(item: Value) -> Self {
+    pub fn detail_as(title: &str, item: Value) -> Self {
         Self {
             items: Vec::new(),
+            title: title.to_owned(),
+            item_title: title.to_owned(),
+            columns: None,
             selected: 0,
             offset: 0,
             page_size: 1,
@@ -79,12 +114,15 @@ impl App {
             .get("items")
             .and_then(Value::as_array)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Trustify SBOM list response has no items array"))?;
+            .ok_or_else(|| anyhow::anyhow!("Trustify list response has no items array"))?;
         if items.is_empty() && offset > self.offset {
             return Ok(false);
         }
 
         self.items = items;
+        if self.columns.is_some() {
+            self.columns = Some(record_columns(&self.items));
+        }
         self.total = response.get("total").and_then(Value::as_u64);
         self.offset = offset;
         self.selected = 0;
@@ -166,6 +204,59 @@ impl App {
     }
 }
 
+fn record_columns(items: &[Value]) -> Vec<String> {
+    let Some(first) = items.first() else {
+        return vec!["value".to_owned()];
+    };
+    let Some(object) = first.as_object() else {
+        return vec!["value".to_owned()];
+    };
+
+    let identity = [
+        "id",
+        "uuid",
+        "identifier",
+        "document_id",
+        "purl",
+        "name",
+        "license",
+    ]
+    .iter()
+    .find(|field| object.get(**field).is_some_and(|value| !value.is_null()));
+    let mut columns = identity
+        .map(|field| vec![(*field).to_owned()])
+        .unwrap_or_default();
+    for field in [
+        "title",
+        "name",
+        "version",
+        "purl",
+        "severity",
+        "score",
+        "published",
+        "licenses",
+        "license",
+        "status",
+        "type",
+    ] {
+        if columns.len() == 5 {
+            break;
+        }
+        if !columns.iter().any(|column| column == field)
+            && object.get(field).is_some_and(|value| !value.is_null())
+        {
+            columns.push(field.to_owned());
+        }
+    }
+    if columns.is_empty() {
+        columns.extend(object.keys().take(5).cloned());
+    }
+    if columns.is_empty() {
+        columns.push("value".to_owned());
+    }
+    columns
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +320,49 @@ mod tests {
             .expect("valid empty page"));
         assert!(app.items.is_empty());
         assert_eq!(app.total, Some(0));
+    }
+
+    #[test]
+    fn resource_rows_choose_useful_summary_columns() {
+        let app = App::records(
+            serde_json::json!({
+                "items": [{
+                    "id": "CVE-2025-1234",
+                    "title": "Example vulnerability",
+                    "severity": "high",
+                    "score": 8.1,
+                    "description": "Long description"
+                }],
+                "total": 1
+            }),
+            ListParams::default(),
+            20,
+            "Vulnerabilities",
+        )
+        .expect("valid resource page");
+
+        assert_eq!(app.title, "Vulnerabilities");
+        assert_eq!(
+            app.columns,
+            Some(vec![
+                "id".to_owned(),
+                "title".to_owned(),
+                "severity".to_owned(),
+                "score".to_owned()
+            ])
+        );
+    }
+
+    #[test]
+    fn scalar_resource_rows_have_a_value_column() {
+        let app = App::records(
+            serde_json::json!({"items": ["MIT", "Apache-2.0"]}),
+            ListParams::default(),
+            20,
+            "Licenses",
+        )
+        .expect("valid scalar resource page");
+
+        assert_eq!(app.columns, Some(vec!["value".to_owned()]));
     }
 }

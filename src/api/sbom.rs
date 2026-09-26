@@ -1,12 +1,6 @@
-use crate::api::{ApiClient, ApiError};
+pub use crate::api::ListParams;
 
-#[derive(Debug, Default)]
-pub struct ListParams {
-    pub query: Option<String>,
-    pub limit: Option<u32>,
-    pub offset: Option<u32>,
-    pub sort: Option<String>,
-}
+use crate::api::{ApiClient, ApiError};
 
 pub async fn list(client: &ApiClient, params: &ListParams) -> Result<serde_json::Value, ApiError> {
     client.list_sboms(params).await
