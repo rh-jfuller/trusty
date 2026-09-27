@@ -10,6 +10,7 @@ pub async fn search(client: &ApiClient, params: &ListParams) -> Result<Value, Ap
         limit = params.limit,
         offset = params.offset,
         sort = ?params.sort,
+        total = params.total,
         "Trustify API request"
     );
     let api = client.generated_api();
@@ -17,6 +18,7 @@ pub async fn search(client: &ApiClient, params: &ListParams) -> Result<Value, Ap
     let limit = params.limit;
     let offset = params.offset;
     let sort = params.sort.clone();
+    let total = params.total;
 
     client
         .send_with_refresh(move || {
@@ -36,6 +38,9 @@ pub async fn search(client: &ApiClient, params: &ListParams) -> Result<Value, Ap
                 }
                 if let Some(sort) = sort {
                     request = request.sort(sort);
+                }
+                if total {
+                    request = request.total(true);
                 }
                 request.send().await
             }

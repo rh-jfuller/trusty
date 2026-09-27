@@ -82,11 +82,23 @@ async fn stdio_server_lists_tools_and_forwards_a_tool_call() {
         .iter()
         .find(|response| response["id"] == 2)
         .expect("tools/list response");
-    assert!(tools["result"]["tools"]
-        .as_array()
-        .expect("tool list")
-        .iter()
-        .any(|tool| tool["name"] == "list_advisories"));
+    let tool_list = tools["result"]["tools"].as_array().expect("tool list");
+    for name in [
+        "list_advisories",
+        "list_products",
+        "get_product",
+        "list_exploits",
+        "get_exploit",
+        "list_weaknesses",
+        "get_weakness",
+        "list_organizations",
+        "get_organization",
+    ] {
+        assert!(
+            tool_list.iter().any(|tool| tool["name"] == name),
+            "missing MCP tool {name}"
+        );
+    }
 
     let call = responses
         .iter()

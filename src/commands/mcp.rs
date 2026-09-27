@@ -30,13 +30,14 @@ impl From<ListArgs> for ListParams {
             limit: args.limit,
             offset: args.offset,
             sort: args.sort,
+            total: false,
         }
     }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct IdArgs {
-    /// SBOM identifier.
+    /// Resource identifier.
     id: String,
 }
 
@@ -118,6 +119,23 @@ impl TrustyMcp {
     }
 
     #[tool(
+        description = "List known exploits. Supports Trustify query, pagination, and sorting.",
+        annotations(read_only_hint = true)
+    )]
+    async fn list_exploits(&self, Parameters(args): Parameters<ListArgs>) -> CallToolResult {
+        let params = ListParams::from(args);
+        Self::tool_result(api::exploit::list(&self.client, &params).await)
+    }
+
+    #[tool(
+        description = "Get an exploit by its identifier.",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_exploit(&self, Parameters(args): Parameters<IdArgs>) -> CallToolResult {
+        Self::tool_result(api::exploit::get(&self.client, &args.id).await)
+    }
+
+    #[tool(
         description = "List vulnerabilities. Supports Trustify query, pagination, and sorting.",
         annotations(read_only_hint = true)
     )]
@@ -127,7 +145,7 @@ impl TrustyMcp {
     }
 
     #[tool(
-        description = "Get a vulnerability by CVE or other identifier. Optionally include contributing-advisory scores.",
+        description = "Get a vulnerability by CVE or other identifier; optionally include contributing-advisory scores.",
         annotations(read_only_hint = true)
     )]
     async fn get_vulnerability(
@@ -140,7 +158,7 @@ impl TrustyMcp {
     }
 
     #[tool(
-        description = "Search fully-qualified Package URLs. Supports Trustify query, pagination, and sorting.",
+        description = "Search Package URLs. Supports Trustify query, pagination, and sorting.",
         annotations(read_only_hint = true)
     )]
     async fn search_packages(&self, Parameters(args): Parameters<ListArgs>) -> CallToolResult {
@@ -163,6 +181,57 @@ impl TrustyMcp {
     async fn list_licenses(&self, Parameters(args): Parameters<ListArgs>) -> CallToolResult {
         let params = ListParams::from(args);
         Self::tool_result(api::license::list(&self.client, &params).await)
+    }
+
+    #[tool(
+        description = "List organizations. Supports Trustify query, pagination, and sorting.",
+        annotations(read_only_hint = true)
+    )]
+    async fn list_organizations(&self, Parameters(args): Parameters<ListArgs>) -> CallToolResult {
+        let params = ListParams::from(args);
+        Self::tool_result(api::organization::list(&self.client, &params).await)
+    }
+
+    #[tool(
+        description = "Get an organization by UUID.",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_organization(&self, Parameters(args): Parameters<IdArgs>) -> CallToolResult {
+        Self::tool_result(api::organization::get(&self.client, &args.id).await)
+    }
+
+    #[tool(
+        description = "List products. Supports Trustify query, pagination, and sorting.",
+        annotations(read_only_hint = true)
+    )]
+    async fn list_products(&self, Parameters(args): Parameters<ListArgs>) -> CallToolResult {
+        let params = ListParams::from(args);
+        Self::tool_result(api::product::list(&self.client, &params).await)
+    }
+
+    #[tool(
+        description = "Get a product by UUID.",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_product(&self, Parameters(args): Parameters<IdArgs>) -> CallToolResult {
+        Self::tool_result(api::product::get(&self.client, &args.id).await)
+    }
+
+    #[tool(
+        description = "List weaknesses. Supports Trustify query, pagination, and sorting.",
+        annotations(read_only_hint = true)
+    )]
+    async fn list_weaknesses(&self, Parameters(args): Parameters<ListArgs>) -> CallToolResult {
+        let params = ListParams::from(args);
+        Self::tool_result(api::weakness::list(&self.client, &params).await)
+    }
+
+    #[tool(
+        description = "Get a weakness by its identifier, such as a CWE ID.",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_weakness(&self, Parameters(args): Parameters<IdArgs>) -> CallToolResult {
+        Self::tool_result(api::weakness::get(&self.client, &args.id).await)
     }
 }
 
@@ -191,11 +260,19 @@ mod tests {
             "get_sbom",
             "list_advisories",
             "get_advisory",
+            "list_exploits",
+            "get_exploit",
             "list_vulnerabilities",
             "get_vulnerability",
             "search_packages",
             "get_package",
             "list_licenses",
+            "list_products",
+            "get_product",
+            "list_weaknesses",
+            "get_weakness",
+            "list_organizations",
+            "get_organization",
         ] {
             assert!(router.map.contains_key(name), "missing MCP tool: {name}");
         }

@@ -6,8 +6,8 @@ use crate::{
 };
 
 #[derive(Debug, Subcommand)]
-pub enum VulnerabilityCommands {
-    /// List vulnerabilities, optionally using Trustify's query syntax
+pub enum OrganizationCommands {
+    /// List organizations, optionally using Trustify's query syntax
     List {
         #[command(flatten)]
         options: ListOptions,
@@ -16,37 +16,33 @@ pub enum VulnerabilityCommands {
         output: OutputOptions,
     },
 
-    /// Get a vulnerability by ID
+    /// Get an organization by UUID
     Get {
-        /// Vulnerability identifier, such as a CVE ID
+        /// Organization UUID
         id: String,
-
-        /// Include the full scores array from the contributing advisory
-        #[arg(long)]
-        scores: bool,
 
         #[command(flatten)]
         output: OutputOptions,
     },
 }
 
-impl VulnerabilityCommands {
+impl OrganizationCommands {
     pub async fn run(&self, client: &ApiClient) -> anyhow::Result<()> {
         match self {
             Self::List { options, output } => {
                 commands::list_resource(
                     client,
-                    ListResource::Vulnerability,
-                    "Vulnerabilities",
+                    ListResource::Organization,
+                    "Organizations",
                     options,
                     output,
                 )
                 .await?;
             }
-            Self::Get { id, scores, output } => {
+            Self::Get { id, output } => {
                 let mode = output.format.resolve()?;
-                let response = api::vulnerability::get(client, id, *scores).await?;
-                commands::show_record(client, response, "Vulnerability", mode).await?;
+                let response = api::organization::get(client, id).await?;
+                commands::show_record(client, response, "Organization", mode).await?;
             }
         }
         Ok(())
