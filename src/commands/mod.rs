@@ -1,9 +1,13 @@
 mod advisory;
+mod exploit;
 mod license;
 mod mcp;
+mod organization;
 mod package;
+mod product;
 mod sbom;
 mod vulnerability;
+mod weakness;
 
 use clap::{Args, Subcommand};
 use serde_json::Value;
@@ -11,6 +15,7 @@ use serde_json::Value;
 use crate::{
     api::{self, ApiClient, ListParams, ListResource},
     output::{self, OutputFormat, OutputMode},
+    settings::{AppSettings, DEFAULT_PAGE_SIZE},
 };
 
 #[derive(Clone, Debug, Default, Args)]
@@ -39,6 +44,7 @@ impl From<&ListOptions> for ListParams {
             limit: options.limit,
             offset: options.offset,
             sort: options.sort.clone(),
+            total: false,
         }
     }
 }
@@ -58,46 +64,106 @@ pub async fn list_resource(
     output_options: &OutputOptions,
 ) -> anyhow::Result<()> {
     let mode = output_options.format.resolve()?;
+    let settings = if mode == OutputMode::Tui {
+        Some(AppSettings::load()?)
+    } else {
+        None
+    };
     let mut params = ListParams::from(options);
     if mode == OutputMode::Tui {
-        params.limit = Some(params.limit.unwrap_or(20).max(1));
+        let default_page_size = settings
+            .as_ref()
+            .map(|settings| settings.page_size)
+            .unwrap_or(DEFAULT_PAGE_SIZE);
+        params.limit = Some(params.limit.unwrap_or(default_page_size).max(1));
+        params.total = true;
+        if params.sort.is_none() {
+            params.sort = settings
+                .as_ref()
+                .and_then(|settings| settings.default_sort(resource))
+                .map(str::to_owned);
+        }
     }
     let response = api::list_resource(client, resource, &params).await?;
 
     match mode {
         OutputMode::Json => output::print_json(&response)?,
         OutputMode::Tui => {
+            let theme = settings
+                .as_ref()
+                .map(|settings| settings.theme)
+                .unwrap_or_default();
             if resource == ListResource::Sbom {
-                output::tui::browse_sboms(client, params, response).await?;
+                output::tui::browse_sboms(client, params, response, theme).await?;
             } else {
-                output::tui::browse_records(client, resource, title, params, response).await?;
+                output::tui::browse_records(client, resource, title, params, response, theme)
+                    .await?;
             }
         }
     }
     Ok(())
 }
 
-pub async fn show_record(response: Value, title: &str, mode: OutputMode) -> anyhow::Result<()> {
+pub async fn show_record(
+    client: &ApiClient,
+    response: Value,
+    title: &str,
+    mode: OutputMode,
+) -> anyhow::Result<()> {
     match mode {
         OutputMode::Json => output::print_json(&response)?,
-        OutputMode::Tui => output::tui::show_detail_as(title, response).await?,
+        OutputMode::Tui => {
+            let settings = AppSettings::load()?;
+            output::tui::show_detail_as_on(
+                title,
+                response,
+                &client.instance_label(),
+                client,
+                settings.theme,
+            )
+            .await?
+        }
     }
     Ok(())
 }
 
-pub async fn run_entity_list(client: &ApiClient, resource: ListResource) -> anyhow::Result<()> {
-    let options = ListOptions::default();
-    let output_options = OutputOptions {
-        format: OutputFormat::Tui,
+pub async fn run_entity_list(
+    client: &ApiClient,
+    resource: ListResource,
+    counts: &output::tui::EntityCountCache,
+    settings: &AppSettings,
+) -> anyhow::Result<()> {
+    let cached_total = counts.total(resource);
+    let page_size = settings.page_size.max(1);
+    let params = ListParams {
+        limit: Some(page_size),
+        sort: settings.default_sort(resource).map(str::to_owned),
+        total: cached_total.is_none(),
+        ..ListParams::default()
     };
     let title = match resource {
         ListResource::Sbom => "SBOMs",
         ListResource::Advisory => "Advisories",
+        ListResource::Exploit => "Exploits",
         ListResource::License => "Licenses",
+        ListResource::Organization => "Organizations",
         ListResource::Package => "Packages",
+        ListResource::Product => "Products",
         ListResource::Vulnerability => "Vulnerabilities",
+        ListResource::Weakness => "Weaknesses",
     };
-    list_resource(client, resource, title, &options, &output_options).await
+    let mut response = api::list_resource(client, resource, &params).await?;
+    if let Some(total) = cached_total {
+        response["total"] = Value::from(total);
+    } else if let Some(total) = response.get("total").and_then(Value::as_u64) {
+        counts.set_total(resource, Some(total));
+    }
+
+    if resource == ListResource::Sbom {
+        output::tui::browse_sboms(client, params, response, settings.theme).await
+    } else {
+        output::tui::browse_records(client, resource, title, params, response, settings.theme).await
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -121,6 +187,12 @@ pub enum Commands {
         command: advisory::AdvisoryCommands,
     },
 
+    /// Browse and inspect known exploits
+    Exploit {
+        #[command(subcommand)]
+        command: exploit::ExploitCommands,
+    },
+
     /// Browse licenses found in SBOMs
     License {
         #[command(subcommand)]
@@ -134,6 +206,24 @@ pub enum Commands {
         command: package::PackageCommands,
     },
 
+    /// Browse and inspect products
+    Product {
+        #[command(subcommand)]
+        command: product::ProductCommands,
+    },
+
+    /// Browse and inspect organizations
+    Organization {
+        #[command(subcommand)]
+        command: organization::OrganizationCommands,
+    },
+
+    /// Browse and inspect weaknesses
+    Weakness {
+        #[command(subcommand)]
+        command: weakness::WeaknessCommands,
+    },
+
     /// Run the Trusty MCP server over standard input/output
     Mcp,
 }
@@ -144,8 +234,12 @@ impl Commands {
             Self::Sbom { command } => command.run(client).await,
             Self::Vuln { command } => command.run(client).await,
             Self::Advisory { command } => command.run(client).await,
+            Self::Exploit { command } => command.run(client).await,
             Self::License { command } => command.run(client).await,
             Self::Package { command } => command.run(client).await,
+            Self::Product { command } => command.run(client).await,
+            Self::Organization { command } => command.run(client).await,
+            Self::Weakness { command } => command.run(client).await,
             Self::Mcp => mcp::run(client.clone()).await,
         }
     }
