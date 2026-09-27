@@ -1,10 +1,8 @@
 use serde_json::Value;
+use trustify_client::api::ClientWeaknessExt;
 
 use crate::api::{ApiClient, ApiError, ListParams};
 
-// trustify-client 0.1.1 models these as PaginatedResultsLicenseSummary and
-// LicenseSummary, while Trustify returns WeaknessSummary and WeaknessDetails.
-// Use the authenticated raw JSON path until its OpenAPI response types are fixed.
 pub async fn list(client: &ApiClient, params: &ListParams) -> Result<Value, ApiError> {
     tracing::debug!(
         operation = "weakness.list",
@@ -15,31 +13,49 @@ pub async fn list(client: &ApiClient, params: &ListParams) -> Result<Value, ApiE
         total = params.total,
         "Trustify API request"
     );
-    let mut query = Vec::with_capacity(4);
-    if let Some(value) = params.query.as_deref() {
-        query.push(("q", value.to_owned()));
-    }
-    if let Some(value) = params.limit {
-        query.push(("limit", value.to_string()));
-    }
-    if let Some(value) = params.offset {
-        query.push(("offset", value.to_string()));
-    }
-    if let Some(value) = params.sort.as_deref() {
-        query.push(("sort", value.to_owned()));
-    }
-    if params.total {
-        query.push(("total", "true".to_owned()));
-    }
-
+    let api = client.generated_api();
+    let query = params.query.clone();
+    let limit = params.limit;
+    let offset = params.offset;
+    let sort = params.sort.clone();
+    let total = params.total;
     client
-        .raw_api_get("weakness.list", &["weakness"], &query)
+        .send_with_refresh(move || {
+            let api = api.clone();
+            let query = query.clone();
+            let sort = sort.clone();
+            async move {
+                let mut request = api.list_weaknesses();
+                if let Some(query) = query {
+                    request = request.q(query);
+                }
+                if let Some(limit) = limit {
+                    request = request.limit(i64::from(limit));
+                }
+                if let Some(offset) = offset {
+                    request = request.offset(i64::from(offset));
+                }
+                if let Some(sort) = sort {
+                    request = request.sort(sort);
+                }
+                if total {
+                    request = request.total(true);
+                }
+                request.send().await
+            }
+        })
         .await
 }
 
 pub async fn get(client: &ApiClient, id: &str) -> Result<Value, ApiError> {
     tracing::debug!(operation = "weakness.get", id, "Trustify API request");
+    let api = client.generated_api();
+    let id = id.to_owned();
     client
-        .raw_api_get("weakness.get", &["weakness", id], &[])
+        .send_with_refresh(move || {
+            let api = api.clone();
+            let id = id.clone();
+            async move { api.get_weakness().id(id).send().await }
+        })
         .await
 }

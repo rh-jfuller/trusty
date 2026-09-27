@@ -15,26 +15,37 @@ pub async fn list(client: &ApiClient, params: &ListParams) -> Result<Value, ApiE
         total = params.total,
         "Trustify API request"
     );
-    let mut query = Vec::with_capacity(4);
-    if let Some(value) = params.query.as_deref() {
-        query.push(("q", value.to_owned()));
-    }
-    if let Some(value) = params.limit {
-        query.push(("limit", value.to_string()));
-    }
-    if let Some(value) = params.offset {
-        query.push(("offset", value.to_string()));
-    }
-    if let Some(value) = params.sort.as_deref() {
-        query.push(("sort", value.to_owned()));
-    }
-    if params.total {
-        query.push(("total", "true".to_owned()));
-    }
-
-    // The generated client models this paginated endpoint as one summary.
+    let api = client.generated_api();
+    let query = params.query.clone();
+    let limit = params.limit;
+    let offset = params.offset;
+    let sort = params.sort.clone();
+    let total = params.total;
     let response = client
-        .raw_api_get("organization.list", &["organization"], &query)
+        .send_with_refresh(move || {
+            let api = api.clone();
+            let query = query.clone();
+            let sort = sort.clone();
+            async move {
+                let mut request = api.list_organizations();
+                if let Some(query) = query {
+                    request = request.q(query);
+                }
+                if let Some(limit) = limit {
+                    request = request.limit(i64::from(limit));
+                }
+                if let Some(offset) = offset {
+                    request = request.offset(i64::from(offset));
+                }
+                if let Some(sort) = sort {
+                    request = request.sort(sort);
+                }
+                if total {
+                    request = request.total(true);
+                }
+                request.send().await
+            }
+        })
         .await?;
     let all_items_received = params.offset.unwrap_or_default() == 0
         && response

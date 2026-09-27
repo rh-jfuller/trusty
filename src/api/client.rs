@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::RwLock;
 use trustify_client::{
-    api::{ClientInfo, ClientSbomExt, Error as TrustifyError, ResponseValue},
+    api::{ClientSbomExt, Error as TrustifyError, ResponseValue},
     AccessTokenProvider, RetryPolicy, TrustifyClient,
 };
 
@@ -248,81 +248,6 @@ impl ApiClient {
 
     pub(crate) fn generated_api(&self) -> trustify_client::api::Client {
         self.client.api().clone()
-    }
-
-    pub(crate) async fn raw_api_get(
-        &self,
-        operation: &'static str,
-        path: &[&str],
-        query: &[(&str, String)],
-    ) -> Result<Value, ApiError> {
-        let mut url = self.api_url.clone();
-        {
-            let mut segments = url.path_segments_mut().map_err(|_| {
-                ApiError::InvalidConfiguration("API URL cannot be used as a base URL".to_owned())
-            })?;
-            segments.pop_if_empty();
-            segments.extend(path);
-        }
-
-        let mut token_refreshed = false;
-        loop {
-            let started = Instant::now();
-            tracing::trace!(operation, "sending raw Trustify API request");
-            let mut request = self
-                .http
-                .get(url.clone())
-                .header("api-version", trustify_client::api::Client::api_version())
-                .query(query);
-            if let Some(token_state) = &self.token {
-                if let Some(token) = token_state.read().await.as_ref() {
-                    request = request.bearer_auth(token);
-                }
-            }
-
-            let response = request.send().await?;
-            if response.status() == StatusCode::UNAUTHORIZED && !token_refreshed {
-                if let Some(oauth) = &self.oauth {
-                    tracing::warn!(
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        "Trustify rejected the access token; refreshing OAuth credentials"
-                    );
-                    token_refreshed = true;
-                    let token = get_token(&self.http, oauth).await?;
-                    if let Some(token_state) = &self.token {
-                        *token_state.write().await = Some(token);
-                    }
-                    continue;
-                }
-            }
-
-            let status = response.status();
-            let body = response.bytes().await?;
-            tracing::trace!(
-                operation,
-                http_status = status.as_u16(),
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "raw Trustify API response received"
-            );
-            if !status.is_success() {
-                tracing::debug!(
-                    operation,
-                    status = status.as_u16(),
-                    "Trustify API request failed"
-                );
-                return Err(ApiError::HttpStatus {
-                    status,
-                    body: String::from_utf8_lossy(&body).into_owned(),
-                });
-            }
-
-            let value: Value = serde_json::from_slice(&body)?;
-            if crate::logging::full_diagnostics_enabled() {
-                let redacted = crate::logging::redact_sensitive_fields(&value);
-                tracing::trace!(response = %redacted, "Trustify API response body");
-            }
-            return Ok(value);
-        }
     }
 
     pub(crate) async fn send_with_refresh<T, F, Fut>(&self, mut send: F) -> Result<Value, ApiError>

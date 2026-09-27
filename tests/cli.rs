@@ -749,7 +749,7 @@ async fn oauth_client_credentials_are_refetched_after_api_unauthorized() {
 }
 
 #[tokio::test]
-async fn oauth_refresh_is_preserved_for_raw_weakness_responses() {
+async fn oauth_refresh_is_preserved_for_generated_weakness_requests() {
     let server = MockServer::start().await;
     let issuer_url = server.uri();
     let token_endpoint = format!("{}/oauth/token", server.uri());
