@@ -21,6 +21,7 @@ trusty sbom list --query 'name~openssl' --sort 'ingested:desc'
 trusty sbom list --limit 20 --format json
 trusty sbom get SBOM_ID
 trusty vuln list --query 'title~openssl'
+trusty vuln list --query 'id=CVE-2024-1234'
 trusty vuln get CVE-2024-1234 --scores
 trusty advisory list --query 'title~openssl'
 trusty exploit list --query 'cve_id=CVE-2024-1234'
@@ -39,6 +40,9 @@ v3 API root. Keep client secrets out of source control.
 `package` is also available as `component`. The vulnerability, advisory,
 exploit, license, package, product, weakness, and organization list/search
 commands accept `--query`, `--limit`, `--offset`, and `--sort`.
+Query fields follow Trustify's server-side filter grammar and may differ from
+the JSON response property names. For vulnerabilities, filter with `id` even
+though vulnerability responses expose that value as `identifier`.
 
 Run `trusty` without a subcommand in an interactive terminal to open the main
 entity menu. Choose SBOMs, vulnerabilities, advisories, exploits, licenses,

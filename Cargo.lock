@@ -2591,9 +2591,9 @@ dependencies = [
 
 [[package]]
 name = "trustify-client"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "071c1069624dcaf60fd2531ca2761a346673916fc60b4c128426058cdf31def9"
+checksum = "16f9b943a5e8f0dbbb5c142b9c6982cc4b4457e5e6c739cfeba1e8b356be06ec"
 dependencies = [
  "async-trait",
  "bytes",
