@@ -1,3 +1,4 @@
+use chrono::{Duration, NaiveDate, Utc};
 use crossterm::event::KeyCode;
 use serde_json::Value;
 
@@ -16,15 +17,32 @@ pub struct DateRange {
 
 impl DateRange {
     fn parse_input(input: &str) -> Result<Option<Self>, String> {
+        Self::parse_input_at(input, Utc::now().date_naive())
+    }
+
+    fn parse_input_at(input: &str, today: NaiveDate) -> Result<Option<Self>, String> {
         let input = input.trim();
         if input.is_empty() {
             return Ok(None);
         }
 
+        let normalized = input.split_whitespace().collect::<Vec<_>>().join(" ");
+        let normalized = normalized.to_ascii_lowercase();
+        let preset = match normalized.as_str() {
+            "today" => Some((today, today)),
+            "last 7 days" => Some((today - Duration::days(6), today)),
+            "last 30 days" => Some((today - Duration::days(29), today)),
+            _ => None,
+        };
+        if let Some((from, to)) = preset {
+            return Ok(Some(Self {
+                from: Some(from.format("%Y-%m-%d").to_string()),
+                to: Some(to.format("%Y-%m-%d").to_string()),
+            }));
+        }
+
         let Some((from, to)) = input.split_once("..") else {
-            return Err(
-                "Use YYYY-MM-DD..YYYY-MM-DD; leave one side blank for an open range".into(),
-            );
+            return Err("Use today, last 7 days, last 30 days, or YYYY-MM-DD..YYYY-MM-DD; leave one side blank for an open range".into());
         };
         if to.contains("..") {
             return Err("Date range must contain one '..' separator".into());
@@ -1166,6 +1184,33 @@ mod tests {
             app.handle_key(KeyCode::Enter),
             Action::SetDateRange(Some(DateRange {
                 from: Some("2024-02-29".to_owned()),
+                to: Some("2024-03-01".to_owned()),
+            }))
+        );
+    }
+
+    #[test]
+    fn date_range_presets_include_today_and_the_previous_calendar_days() {
+        let today = NaiveDate::from_ymd_opt(2024, 3, 1).expect("valid date");
+
+        assert_eq!(
+            DateRange::parse_input_at("today", today),
+            Ok(Some(DateRange {
+                from: Some("2024-03-01".to_owned()),
+                to: Some("2024-03-01".to_owned()),
+            }))
+        );
+        assert_eq!(
+            DateRange::parse_input_at("Last 7 days", today),
+            Ok(Some(DateRange {
+                from: Some("2024-02-24".to_owned()),
+                to: Some("2024-03-01".to_owned()),
+            }))
+        );
+        assert_eq!(
+            DateRange::parse_input_at(" last   30 days ", today),
+            Ok(Some(DateRange {
+                from: Some("2024-02-01".to_owned()),
                 to: Some("2024-03-01".to_owned()),
             }))
         );

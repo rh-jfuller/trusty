@@ -128,6 +128,17 @@ impl EntityCountCache {
         true
     }
 
+    fn begin_refresh(&self, resource: ListResource) -> bool {
+        let mut values = self.values.lock().expect("entity count cache poisoned");
+        if matches!(values.get(&resource), Some(EntityCount::Loading)) {
+            return false;
+        }
+        values.insert(resource, EntityCount::Loading);
+        drop(values);
+        self.updates.send_replace(());
+        true
+    }
+
     pub fn total(&self, resource: ListResource) -> Option<u64> {
         match self
             .values
@@ -164,9 +175,14 @@ impl EntityCountCache {
     }
 }
 
-fn start_entity_count_requests(client: &ApiClient, counts: &EntityCountCache) {
+fn start_entity_count_requests(client: &ApiClient, counts: &EntityCountCache, refresh: bool) {
     for entry in MENU_ENTRIES {
-        if !counts.begin_fetch(entry.resource) {
+        let should_fetch = if refresh {
+            counts.begin_refresh(entry.resource)
+        } else {
+            counts.begin_fetch(entry.resource)
+        };
+        if !should_fetch {
             continue;
         }
 
@@ -195,6 +211,7 @@ enum MenuAction {
     None,
     Exit,
     Select(ListResource),
+    RefreshCounts,
     OpenSettings,
     SaveSettings,
 }
@@ -319,6 +336,7 @@ impl MenuState {
                 self.help_open = true;
                 MenuAction::None
             }
+            KeyCode::Char('r') => MenuAction::RefreshCounts,
             KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = self.selected.saturating_sub(1);
                 MenuAction::None
@@ -409,6 +427,11 @@ pub async fn main_menu(
                     MenuAction::None => {}
                     MenuAction::Exit => return Ok(None),
                     MenuAction::Select(resource) => return Ok(Some((resource, menu.selected))),
+                    MenuAction::RefreshCounts => {
+                        if let Some(Ok(client)) = client_updates.borrow().clone() {
+                            start_entity_count_requests(&client, counts, true);
+                        }
+                    }
                     MenuAction::OpenSettings => {
                         menu.settings_open = true;
                         menu.settings_selected = 0;
@@ -422,7 +445,7 @@ pub async fn main_menu(
 
 fn update_entity_counts(client_result: Result<ApiClient, String>, counts: &EntityCountCache) {
     match client_result {
-        Ok(client) => start_entity_count_requests(&client, counts),
+        Ok(client) => start_entity_count_requests(&client, counts, false),
         Err(_) => {
             for entry in MENU_ENTRIES {
                 if counts.state(entry.resource).is_none() {
@@ -488,6 +511,7 @@ fn render_main_menu(
                 &[
                     "↑/↓ or j/k  Select an entity or settings",
                     "Enter       Open the selected page",
+                    "r           Refresh entity counts",
                     "l           Toggle debug logs",
                     "q/Esc       Exit the entity menu",
                     "h           Show or close this help",
@@ -577,7 +601,7 @@ fn render_main_menu(
         } else {
             " · l logs"
         };
-        format!("↑/↓ or j/k select · Enter open · q/Esc exit{log_hint} · h help{connection_hint}")
+        format!("↑/↓ or j/k select · Enter open · r refresh counts · q/Esc exit{log_hint} · h help{connection_hint}")
     };
     render::render_status(frame, areas[3], &status, theme);
 }
@@ -1147,6 +1171,17 @@ mod tests {
     }
 
     #[test]
+    fn main_menu_r_requests_entity_count_refresh() {
+        let mut menu = MenuState::default();
+        let mut settings = AppSettings::default();
+
+        assert_eq!(
+            menu.handle_key(KeyCode::Char('r'), &mut settings),
+            MenuAction::RefreshCounts
+        );
+    }
+
+    #[test]
     fn menu_exit_keys_close_the_picker() {
         let mut menu = MenuState::default();
         let mut settings = AppSettings::default();
@@ -1353,12 +1388,16 @@ mod tests {
 
         assert!(counts.begin_fetch(ListResource::Sbom));
         assert!(!counts.begin_fetch(ListResource::Sbom));
+        assert!(!counts.begin_refresh(ListResource::Sbom));
         assert_eq!(counts.total(ListResource::Sbom), None);
 
         counts.set_total(ListResource::Sbom, Some(42));
 
         assert_eq!(counts.total(ListResource::Sbom), Some(42));
         assert!(!counts.begin_fetch(ListResource::Sbom));
+        assert!(counts.begin_refresh(ListResource::Sbom));
+        assert_eq!(counts.state(ListResource::Sbom), Some(EntityCount::Loading));
+        assert!(!counts.begin_refresh(ListResource::Sbom));
     }
 
     #[tokio::test]
