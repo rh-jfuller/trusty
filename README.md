@@ -85,7 +85,7 @@ Run `trusty --help` or `trusty sbom --help` for command options.
 Run `trusty mcp` to expose Trustify's read-only operations as Model Context
 Protocol tools over stdio. MCP clients should launch `trusty` with `mcp` as its
 argument and provide the same `TRUSTIFY_URL` and authentication environment
-variables used by the CLI. For example:
+variables used by the CLI. For example using TRUSTIFY_TOKEN:
 
 ```json
 {
@@ -100,6 +100,13 @@ variables used by the CLI. For example:
     }
   }
 }
+```
+alternately setup env vars
+```bash
+export TRUSTIFY_URL="<trustify-service-url>"
+export ISSUER_URL="<oidc-issuer-url>"
+export CLIENT_ID="<client-id>"
+export CLIENT_SECRET="<client-secret>"
 ```
 
 The server provides list/get tools for SBOMs, advisories, exploits,
