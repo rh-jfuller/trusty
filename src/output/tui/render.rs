@@ -909,7 +909,7 @@ fn list_status(app: &App) -> String {
             format!(" · {}", app.status)
         };
         return format!(
-            "Date range ({field}): {input}▏ · YYYY-MM-DD..YYYY-MM-DD · blank clears · Enter apply · Esc cancel{validation}"
+            "Date range ({field}): {input}▏ · today / last 7 days / last 30 days / YYYY-MM-DD..YYYY-MM-DD · blank clears · Enter apply · Esc cancel{validation}"
         );
     }
 
