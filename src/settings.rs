@@ -3,17 +3,25 @@ use std::{collections::BTreeMap, env, fs, io::ErrorKind, path::PathBuf};
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
-use crate::{api::ListResource, output::tui::ThemeMode};
+use crate::{
+    api::{ListParams, ListResource},
+    output::tui::ThemeMode,
+};
 
 pub const DEFAULT_PAGE_SIZE: u32 = 20;
 pub const MAX_PAGE_SIZE: u32 = 1000;
+pub const SEVERITY_FILTER_OPTIONS: [&str; 6] =
+    ["critical", "high", "medium", "low", "none", "unknown"];
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AppSettings {
     pub theme: ThemeMode,
     pub page_size: u32,
+    pub preview_pane_open: bool,
+    pub remember_severity_filter: bool,
     default_sorts: BTreeMap<String, String>,
+    default_severity_filter: Option<Vec<String>>,
 }
 
 impl Default for AppSettings {
@@ -21,6 +29,8 @@ impl Default for AppSettings {
         Self {
             theme: ThemeMode::default(),
             page_size: DEFAULT_PAGE_SIZE,
+            preview_pane_open: true,
+            remember_severity_filter: true,
             default_sorts: [
                 ("sbom", "published:desc"),
                 ("vulnerability", "published:desc"),
@@ -35,6 +45,7 @@ impl Default for AppSettings {
             .into_iter()
             .map(|(resource, sort)| (resource.to_owned(), sort.to_owned()))
             .collect(),
+            default_severity_filter: None,
         }
     }
 }
@@ -116,11 +127,47 @@ impl AppSettings {
         self.default_sorts.remove(resource_key(resource));
     }
 
+    pub fn default_severity_filter(&self) -> Option<&[String]> {
+        self.default_severity_filter.as_deref()
+    }
+
+    pub fn set_default_severity_filter(&mut self, filter: Option<Vec<String>>) {
+        self.default_severity_filter = filter.filter(|filter| !filter.is_empty());
+    }
+
+    pub fn apply_default_severity_filter(&self, params: &mut ListParams) {
+        if !self.remember_severity_filter {
+            return;
+        }
+        let Some(severities) = self.default_severity_filter() else {
+            return;
+        };
+
+        let filter = format!("base_severity={}", severities.join("|"));
+        params.query = Some(
+            match params.query.take().filter(|query| !query.trim().is_empty()) {
+                Some(query) => format!("{query}&{filter}"),
+                None => filter,
+            },
+        );
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             (1..=MAX_PAGE_SIZE).contains(&self.page_size),
             "rows per page must be between 1 and {MAX_PAGE_SIZE}"
         );
+        if let Some(filter) = &self.default_severity_filter {
+            anyhow::ensure!(
+                !filter.is_empty()
+                    && filter.len() <= SEVERITY_FILTER_OPTIONS.len()
+                    && filter.iter().enumerate().all(|(index, severity)| {
+                        SEVERITY_FILTER_OPTIONS.contains(&severity.as_str())
+                            && !filter[..index].contains(severity)
+                    }),
+                "default severity filter contains unsupported or duplicate severities"
+            );
+        }
         Ok(())
     }
 }
@@ -180,25 +227,66 @@ mod tests {
     }
 
     #[test]
+    fn older_settings_default_to_remembering_severity_filters() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{"theme":"dark","page_size":20,"preview_pane_open":true,"default_sorts":{}}"#,
+        )
+        .expect("parse settings without severity-filter fields");
+
+        assert!(settings.remember_severity_filter);
+        assert_eq!(settings.default_severity_filter(), None);
+    }
+
+    #[test]
     fn settings_json_round_trips_theme_and_custom_sorts() {
         let mut settings = AppSettings {
             theme: ThemeMode::Light,
             page_size: 50,
+            preview_pane_open: false,
+            remember_severity_filter: false,
             ..AppSettings::default()
         };
         settings.set_sort(ListResource::Sbom, "ingested:desc".to_owned());
         settings.set_sort(ListResource::Product, String::new());
+        settings.set_default_severity_filter(Some(vec!["critical".to_owned()]));
 
         let json = serde_json::to_string(&settings).expect("serialize settings");
         let restored: AppSettings = serde_json::from_str(&json).expect("parse settings");
 
         assert_eq!(restored.theme, ThemeMode::Light);
         assert_eq!(restored.page_size, 50);
+        assert!(!restored.preview_pane_open);
+        assert!(!restored.remember_severity_filter);
+        assert_eq!(
+            restored.default_severity_filter(),
+            Some(["critical".to_owned()].as_slice())
+        );
         assert_eq!(
             restored.default_sort(ListResource::Sbom),
             Some("ingested:desc")
         );
         assert_eq!(restored.default_sort(ListResource::Product), None);
+    }
+
+    #[test]
+    fn saved_severity_filter_is_added_to_existing_query_only_when_enabled() {
+        let mut settings = AppSettings::default();
+        settings.set_default_severity_filter(Some(vec!["critical".to_owned()]));
+        let mut params = ListParams {
+            query: Some("name~openssl".to_owned()),
+            ..ListParams::default()
+        };
+
+        settings.apply_default_severity_filter(&mut params);
+        assert_eq!(
+            params.query.as_deref(),
+            Some("name~openssl&base_severity=critical")
+        );
+
+        settings.remember_severity_filter = false;
+        params.query = None;
+        settings.apply_default_severity_filter(&mut params);
+        assert_eq!(params.query, None);
     }
 
     #[test]
@@ -211,8 +299,12 @@ mod tests {
             "trusty-settings-{}-{nonce}.json",
             std::process::id()
         ));
-        let mut settings = AppSettings::default();
+        let mut settings = AppSettings {
+            preview_pane_open: false,
+            ..AppSettings::default()
+        };
         settings.set_sort(ListResource::Sbom, "ingested:desc".to_owned());
+        settings.set_default_severity_filter(Some(vec!["critical".to_owned()]));
 
         settings.save_to(&path).expect("write settings file");
         let restored = AppSettings::load_from(&path).expect("read settings file");
@@ -221,6 +313,11 @@ mod tests {
         assert_eq!(
             restored.default_sort(ListResource::Sbom),
             Some("ingested:desc")
+        );
+        assert!(!restored.preview_pane_open);
+        assert_eq!(
+            restored.default_severity_filter(),
+            Some(["critical".to_owned()].as_slice())
         );
         assert!(restored.default_sort(ListResource::Product).is_some());
     }

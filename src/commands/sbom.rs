@@ -51,7 +51,7 @@ impl SbomCommands {
                 format,
             } => {
                 let mode = format.resolve()?;
-                let settings = (mode == OutputMode::Tui)
+                let mut settings = (mode == OutputMode::Tui)
                     .then(AppSettings::load)
                     .transpose()?;
                 let mut params = sbom_api::ListParams {
@@ -59,7 +59,8 @@ impl SbomCommands {
                     limit: *limit,
                     offset: *offset,
                     sort: sort.clone(),
-                    total: mode == OutputMode::Tui,
+                    total: false,
+                    advisories: false,
                 };
                 if params.sort.is_none() {
                     params.sort = settings
@@ -88,9 +89,8 @@ impl SbomCommands {
                             params,
                             response,
                             settings
-                                .as_ref()
-                                .map(|settings| settings.theme)
-                                .unwrap_or_default(),
+                                .as_mut()
+                                .expect("TUI settings are loaded for TUI output"),
                         )
                         .await?;
                     }

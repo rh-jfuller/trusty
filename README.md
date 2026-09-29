@@ -44,6 +44,45 @@ Query fields follow Trustify's server-side filter grammar and may differ from
 the JSON response property names. For vulnerabilities, filter with `id` even
 though vulnerability responses expose that value as `identifier`.
 
+## Vulnerability scans
+
+Use the top-level `scan` command to discover package URLs and ask Trustify to
+analyze them for known vulnerabilities:
+
+```shell
+trusty scan dir:./my-project
+trusty scan sbom:./sbom.cdx.json --format json
+trusty scan pkg:rpm/redhat/openssl@3.0.7
+trusty scan name:openssl
+trusty scan registry:registry.access.redhat.com/ubi9:latest
+trusty scan oci-archive:./image.tar
+trusty scan --format tui
+trusty scan dir:./my-project --format tui
+```
+
+A path to an existing file is treated as an SPDX or CycloneDX JSON SBOM; an
+existing directory is scanned for dependencies. Use `dir:` or `sbom:` to
+specify a path explicitly, `pkg:` for a package URL, `name:` or `component:`
+for a component name, `registry:` for a registry image, and `oci-archive:` for
+an OCI image-layout tar archive. Without a prefix, a path is detected from disk,
+values containing `/` are treated as registry image references, and other
+values are searched as component names.
+
+Directory discovery currently reads `Cargo.lock`, npm `package-lock.json`, Go
+`go.sum`, Python `requirements.txt`, `pyproject.toml`, `poetry.lock`,
+`uv.lock`, and `Pipfile.lock`, Gradle `gradle.lockfile`, installed Debian/Alpine
+package databases, `.rpm` files, and embedded JSON SBOMs. Registry images and
+OCI archives use an attached SBOM when available; otherwise, image layers are
+extracted and scanned with the same directory discovery. Registry pulls use
+anonymous access.
+
+Results are printed as text by default; use `--format json` for structured
+output. With `--format tui`, you can enter or edit the target in the terminal;
+passing a target pre-fills the input. The results view lists analyzed package
+URLs and vulnerability findings. TUI mode requires an interactive terminal.
+The command uses the configured Trustify URL and bearer/OIDC credentials
+described above.
+
 Run `trusty` without a subcommand in an interactive terminal to open the main
 entity menu. Choose SBOMs, vulnerabilities, advisories, exploits, licenses,
 packages/components, products, weaknesses, or organizations to open that
@@ -101,19 +140,22 @@ variables used by the CLI. For example using TRUSTIFY_TOKEN:
   }
 }
 ```
-alternately setup env vars
-```bash
+
+Alternatively, launch the server from a shell with these environment variables:
+
+```shell
 export TRUSTIFY_URL="<trustify-service-url>"
 export ISSUER_URL="<oidc-issuer-url>"
 export CLIENT_ID="<client-id>"
 export CLIENT_SECRET="<client-secret>"
+trusty mcp
 ```
 
-The server provides list/get tools for SBOMs, advisories, exploits,
-vulnerabilities, products, weaknesses, and organizations, plus package search
-and get and license listing. List/search tools accept Trustify query
-expressions plus optional pagination and sorting arguments.
-Protocol messages use stdout; diagnostic logs remain on stderr.
+Tools provide list/get for SBOMs, advisories, exploits, vulnerabilities,
+products, weaknesses, and organizations; package tools support search and get,
+and license tools support listing. List/search tools accept Trustify query
+expressions plus optional pagination and sorting arguments. Protocol messages
+use stdout; diagnostic logs remain on stderr.
 
 ## License
 

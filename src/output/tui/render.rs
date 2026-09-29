@@ -29,6 +29,14 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         render_severity_filter(frame, app, app.theme);
         return;
     }
+    if app.advisory_type_filter_open {
+        render_advisory_type_filter(frame, app, app.theme);
+        return;
+    }
+    if app.purl_filter_open {
+        render_purl_filter(frame, app, app.theme);
+        return;
+    }
 
     match &app.screen {
         Screen::List => render_list(frame, app, app.theme),
@@ -45,11 +53,71 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Screen::ExploitList {
             exploits, selected, ..
         } => render_exploit_list(frame, exploits, *selected, app, app.theme),
+        Screen::SbomVulnerabilityList {
+            sbom_id,
+            vulnerabilities,
+            selected,
+            ..
+        } => render_sbom_vulnerability_list(
+            frame,
+            sbom_id,
+            vulnerabilities,
+            *selected,
+            app,
+            app.theme,
+        ),
+        Screen::SbomPackageList { .. } => render_sbom_package_list(frame, app, app.theme),
     }
 }
 
 fn render_app_help(frame: &mut Frame<'_>, app: &App, theme: ThemeMode) {
     let (context, instructions): (&str, &[&str]) = match &app.screen {
+        Screen::List if app.resource == Some(ListResource::Package) => (
+            "List",
+            &[
+                "↑/↓ or j/k  Move through PURLs",
+                "Enter       Open PURL details",
+                "n/p         Next/previous page",
+                "/           Search; Enter applies, Esc cancels",
+                "s           Edit the sort expression",
+                "f           Filter ecosystem and PURL qualifiers",
+                "v           Toggle the preview pane",
+                "l           Toggle debug logs",
+                "q           Return to the entity menu",
+                "h           Show or close this help",
+            ],
+        ),
+        Screen::List if app.resource == Some(ListResource::Advisory) => (
+            "List",
+            &[
+                "↑/↓ or j/k  Move through rows",
+                "Enter       Open the selected record",
+                "n/p         Next/previous page",
+                "/           Search; Enter applies, Esc cancels",
+                "s           Edit the sort expression",
+                "d           Filter by date when available",
+                "f           Filter advisories by type",
+                "v           Toggle the preview pane",
+                "l           Toggle debug logs",
+                "q           Return to the entity menu",
+                "h           Show or close this help",
+            ],
+        ),
+        Screen::List if app.resource == Some(ListResource::Sbom) => (
+            "SBOM list",
+            &[
+                "↑/↓ or j/k  Move through SBOMs",
+                "Enter       Open the selected SBOM details",
+                "a           Browse this SBOM's vulnerabilities",
+                "n/p         Next/previous page",
+                "/           Search; Enter applies, Esc cancels",
+                "s           Edit the sort expression",
+                "v           Toggle the preview pane",
+                "l           Toggle debug logs",
+                "q           Return to the entity menu",
+                "h           Show or close this help",
+            ],
+        ),
         Screen::List => (
             "List",
             &[
@@ -84,6 +152,24 @@ fn render_app_help(frame: &mut Frame<'_>, app: &App, theme: ThemeMode) {
                 "h           Show or close this help",
             ],
         ),
+        Screen::SbomVulnerabilityList { .. } => (
+            "SBOM vulnerabilities",
+            &[
+                "↑/↓ or j/k  Select a vulnerability",
+                "Enter       Open vulnerability details",
+                "Esc/q       Return to the SBOM details",
+                "h           Show or close this help",
+            ],
+        ),
+        Screen::SbomPackageList { .. } => (
+            "SBOM packages",
+            &[
+                "↑/↓ or j/k  Select a package",
+                "n/p         Next/previous page",
+                "Esc/q       Return to the SBOM details",
+                "h           Show or close this help",
+            ],
+        ),
         Screen::Detail {
             resource: Some(ListResource::Vulnerability),
             ..
@@ -95,6 +181,21 @@ fn render_app_help(frame: &mut Frame<'_>, app: &App, theme: ThemeMode) {
                 "Enter       Choose from associated CWE references",
                 "e           Browse associated exploits",
                 "Esc         Return to the list or CWE selection",
+                "q           Exit the detail view",
+                "l           Toggle debug logs",
+                "h           Show or close this help",
+            ],
+        ),
+        Screen::Detail {
+            resource: Some(ListResource::Sbom),
+            ..
+        } => (
+            "SBOM details",
+            &[
+                "↑/↓ or j/k  Scroll the details",
+                "v           Browse associated vulnerabilities",
+                "p           Browse associated packages",
+                "Esc         Return to the list",
                 "q           Exit the detail view",
                 "l           Toggle debug logs",
                 "h           Show or close this help",
@@ -166,47 +267,89 @@ pub(super) fn render_help_panel(
 }
 
 fn render_severity_filter(frame: &mut Frame<'_>, app: &App, theme: ThemeMode) {
+    render_filter_panel(
+        frame,
+        app,
+        FilterPanel {
+            title: "Filter vulnerabilities by severity",
+            list_title: "Severity",
+            options: &super::app::SEVERITY_FILTER_OPTIONS,
+            draft: &app.severity_filter_draft,
+            selected: app.severity_filter_selected,
+            style_as_severity: true,
+        },
+        theme,
+    );
+}
+
+fn render_advisory_type_filter(frame: &mut Frame<'_>, app: &App, theme: ThemeMode) {
+    render_filter_panel(
+        frame,
+        app,
+        FilterPanel {
+            title: "Filter advisories by type",
+            list_title: "Advisory type",
+            options: &super::app::ADVISORY_TYPE_FILTER_OPTIONS,
+            draft: &app.advisory_type_filter_draft,
+            selected: app.advisory_type_filter_selected,
+            style_as_severity: false,
+        },
+        theme,
+    );
+}
+
+fn render_purl_filter(frame: &mut Frame<'_>, app: &App, theme: ThemeMode) {
     let palette = theme.palette();
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Min(6),
+            Constraint::Min(7),
             Constraint::Length(1),
         ])
         .split(frame.area());
-    render_banner_with_target(
-        frame,
-        areas[0],
-        "Filter vulnerabilities by severity",
-        &app.instance_label,
-        theme,
-    );
+    render_banner_with_target(frame, areas[0], "Filter PURLs", &app.instance_label, theme);
 
-    let items = super::app::SEVERITY_FILTER_OPTIONS
+    let fields = [
+        ("Ecosystem (type)", &app.purl_filter_draft.ecosystem),
+        ("Architecture (arch)", &app.purl_filter_draft.architecture),
+        ("Distribution (distro)", &app.purl_filter_draft.distribution),
+        ("Repository URL", &app.purl_filter_draft.repository_url),
+        (
+            "Custom qualifier key",
+            &app.purl_filter_draft.custom_qualifier_name,
+        ),
+        (
+            "Custom qualifier value",
+            &app.purl_filter_draft.custom_qualifier_value,
+        ),
+    ];
+    let items = fields
         .iter()
-        .map(|severity| {
-            let checked = app
-                .severity_filter_draft
-                .iter()
-                .any(|selected| selected == severity);
-            let checkbox = if checked { "[✓]" } else { "[ ]" };
+        .enumerate()
+        .map(|(index, (label, value))| {
+            let value = if app.purl_filter_editing && index == app.purl_filter_selected {
+                format!("{value}▏")
+            } else if value.is_empty() {
+                "—".to_owned()
+            } else {
+                (*value).clone()
+            };
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    checkbox,
+                    format!("{label}: "),
                     Style::default()
                         .fg(palette.accent_bright)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(" "),
-                Span::styled(severity.to_ascii_uppercase(), severity_style(severity)),
+                Span::raw(value),
             ]))
         })
         .collect::<Vec<_>>();
     let list = List::new(items)
         .block(
             Block::default()
-                .title("Severity")
+                .title("Ecosystem and qualifiers")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(palette.border))
                 .style(Style::default().fg(palette.foreground).bg(palette.surface)),
@@ -219,7 +362,78 @@ fn render_severity_filter(frame: &mut Frame<'_>, app: &App, theme: ThemeMode) {
         )
         .highlight_symbol("› ");
     let mut state = ListState::default();
-    state.select(Some(app.severity_filter_selected));
+    state.select(Some(app.purl_filter_selected));
+    frame.render_stateful_widget(list, areas[1], &mut state);
+    let hint = if app.purl_filter_editing {
+        "Type value · Enter/Esc finish editing"
+    } else {
+        "↑/↓ move · Enter edit · a apply · c clear · Esc cancel"
+    };
+    render_status(frame, areas[2], hint, theme);
+}
+
+struct FilterPanel<'a> {
+    title: &'a str,
+    list_title: &'a str,
+    options: &'static [&'static str],
+    draft: &'a [String],
+    selected: usize,
+    style_as_severity: bool,
+}
+
+fn render_filter_panel(frame: &mut Frame<'_>, app: &App, panel: FilterPanel<'_>, theme: ThemeMode) {
+    let palette = theme.palette();
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(6),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+    render_banner_with_target(frame, areas[0], panel.title, &app.instance_label, theme);
+
+    let items = panel
+        .options
+        .iter()
+        .map(|option| {
+            let checked = panel.draft.iter().any(|selected| selected == option);
+            let checkbox = if checked { "[✓]" } else { "[ ]" };
+            let label = option.to_ascii_uppercase();
+            let value = if panel.style_as_severity {
+                Span::styled(label, severity_style(option))
+            } else {
+                Span::raw(label)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    checkbox,
+                    Style::default()
+                        .fg(palette.accent_bright)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                value,
+            ]))
+        })
+        .collect::<Vec<_>>();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(panel.list_title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(palette.border))
+                .style(Style::default().fg(palette.foreground).bg(palette.surface)),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(palette.selection_foreground)
+                .bg(palette.selection)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("› ");
+    let mut state = ListState::default();
+    state.select(Some(panel.selected));
     frame.render_stateful_widget(list, areas[1], &mut state);
     render_status(
         frame,
@@ -281,8 +495,46 @@ pub(super) fn render_settings_panel(
         ),
         Span::styled(format!("  {page_size}"), Style::default().fg(palette.muted)),
     ])));
+    let preview_pane = if settings.preview_pane_open {
+        "Visible"
+    } else {
+        "Hidden"
+    };
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled(
+            "Preview pane",
+            Style::default()
+                .fg(palette.accent_bright)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {preview_pane}"),
+            Style::default().fg(palette.muted),
+        ),
+    ])));
+    let remember_filter = if settings.remember_severity_filter {
+        "On"
+    } else {
+        "Off"
+    };
+    let saved_filter = settings
+        .default_severity_filter()
+        .map(|severities| severities.join(", "))
+        .unwrap_or_else(|| "none saved".to_owned());
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled(
+            "Remember vulnerability filter",
+            Style::default()
+                .fg(palette.accent_bright)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {remember_filter} · {saved_filter}"),
+            Style::default().fg(palette.muted),
+        ),
+    ])));
     for (index, (resource, title)) in sort_rows.iter().enumerate() {
-        let row_index = index + 2;
+        let row_index = index + 4;
         let is_editing = editing.is_some() && row_index == selected;
         let sort = if is_editing {
             editing.unwrap_or_default()
@@ -330,7 +582,7 @@ pub(super) fn render_settings_panel(
             AppSettings::config_path().display()
         ),
         None => format!(
-            "Enter toggles appearance or edits value · r resets · saved to {}",
+            "Enter toggles appearance/preview/filter memory or edits sort · r resets · saved to {}",
             AppSettings::config_path().display()
         ),
     };
@@ -497,9 +749,17 @@ fn render_list(frame: &mut Frame<'_>, app: &App, theme: ThemeMode) {
                     columns
                         .iter()
                         .map(|column| {
-                            let value = record_value(item, column);
-                            if app.resource == Some(ListResource::Vulnerability)
-                                && column == "severity"
+                            let value = if app.resource == Some(ListResource::Vulnerability)
+                                && column == "known_exploit"
+                            {
+                                app.known_exploit_label(item).to_owned()
+                            } else {
+                                record_value(item, column)
+                            };
+                            if matches!(
+                                app.resource,
+                                Some(ListResource::Advisory | ListResource::Vulnerability)
+                            ) && column == "severity"
                                 && value != "—"
                             {
                                 Cell::from(Line::from(Span::styled(
@@ -526,21 +786,33 @@ fn render_list(frame: &mut Frame<'_>, app: &App, theme: ThemeMode) {
                     Cell::from(first_value(item, &["name"])),
                     Cell::from(value_text(item.get("published"))),
                     Cell::from(value_text(item.get("number_of_packages"))),
+                    Cell::from(app.sbom_vulnerability_count_label(item).unwrap_or_else(|| {
+                        sbom_vulnerability_count(item)
+                            .map_or_else(|| "—".to_owned(), |count| count.to_string())
+                    })),
                     Cell::from(value_text(item.get("suppliers"))),
                 ])
             })
             .collect::<Vec<_>>();
         (
-            ["DOCUMENT ID", "NAME", "PUBLISHED", "PACKAGES", "SUPPLIERS"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
+            [
+                "DOCUMENT ID",
+                "NAME",
+                "PUBLISHED",
+                "PACKAGES",
+                "VULNERABILITIES",
+                "SUPPLIERS",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
             rows,
             vec![
                 Constraint::Length(20),
                 Constraint::Min(16),
                 Constraint::Length(18),
                 Constraint::Length(10),
+                Constraint::Length(16),
                 Constraint::Min(12),
             ],
         )
@@ -588,7 +860,8 @@ fn render_preview_pane(
 ) {
     let palette = theme.palette();
     let (title, lines) = if let Some(item) = item {
-        let fields = detail_fields(item, app.resource);
+        let mut fields = detail_fields(item, app.resource);
+        add_sbom_vulnerability_count(&mut fields, item, app);
         let lines = if fields.is_empty() {
             vec![Line::from("No information available")]
         } else {
@@ -646,7 +919,8 @@ fn render_detail(
     let palette = theme.palette();
     let id = record_id(item, resource).unwrap_or("details");
     let title = format!("{item_title} · {id}");
-    let fields = detail_fields(item, resource);
+    let mut fields = detail_fields(item, resource);
+    add_sbom_vulnerability_count(&mut fields, item, app);
     let lines = if fields.is_empty() {
         vec![Line::from("No information available")]
     } else {
@@ -660,7 +934,14 @@ fn render_detail(
                             .fg(palette.accent_bright)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    if label.ends_with("SEVERITY") {
+                    if label == "VULNERABILITIES" {
+                        Span::styled(
+                            value.clone(),
+                            Style::default()
+                                .fg(palette.accent_bright)
+                                .add_modifier(Modifier::UNDERLINED),
+                        )
+                    } else if label.ends_with("SEVERITY") {
                         Span::styled(value.clone(), severity_style(&value))
                     } else {
                         Span::raw(value)
@@ -724,6 +1005,7 @@ fn render_detail(
     };
     let relationship_hint = match resource {
         Some(ListResource::Vulnerability) => " · e related exploits",
+        Some(ListResource::Sbom) => " · v associated vulnerabilities · p associated packages",
         Some(ListResource::Exploit) if item.get("cve_id").and_then(Value::as_str).is_some() => {
             " · v vulnerability"
         }
@@ -873,6 +1155,202 @@ fn render_exploit_list(
     );
 }
 
+fn render_sbom_vulnerability_list(
+    frame: &mut Frame<'_>,
+    sbom_id: &str,
+    vulnerabilities: &[Value],
+    selected: usize,
+    app: &App,
+    theme: ThemeMode,
+) {
+    let palette = theme.palette();
+    let log_pane_height = if app.log_pane_open {
+        Constraint::Length(5)
+    } else {
+        Constraint::Length(0)
+    };
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(5),
+            log_pane_height,
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+    render_banner_with_target(
+        frame,
+        layout[0],
+        &format!("Vulnerabilities for SBOM {sbom_id}"),
+        &app.instance_label,
+        theme,
+    );
+    let items = vulnerabilities
+        .iter()
+        .map(|vulnerability| {
+            let identifier = first_value(vulnerability, &["identifier", "id"]);
+            let severity = value_text(vulnerability.get("severity"));
+            let score = value_text(vulnerability.get("score"));
+            let status = value_text(vulnerability.get("status"));
+            let title = value_text(vulnerability.get("title"));
+            let package_count = vulnerability
+                .get("packages")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let severity_span = if severity == "—" {
+                Span::raw(severity)
+            } else {
+                Span::styled(severity.clone(), severity_style(&severity))
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    identifier,
+                    Style::default()
+                        .fg(palette.accent_bright)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" · "),
+                severity_span,
+                Span::raw(format!(
+                    " {score} · {status} · {package_count} package(s) · {title}"
+                )),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title("Associated vulnerabilities · Enter inspect")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(palette.border))
+                .style(Style::default().fg(palette.foreground).bg(palette.surface)),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(palette.selection_foreground)
+                .bg(palette.selection)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("› ");
+    let mut state = ListState::default();
+    state.select((!vulnerabilities.is_empty()).then_some(selected));
+    frame.render_stateful_widget(list, layout[1], &mut state);
+    if app.log_pane_open {
+        render_log_pane(frame, layout[2], theme);
+    }
+    let status = if app.status.is_empty() {
+        "↑/↓ or j/k choose · Enter inspect · Esc/q back · h help".to_owned()
+    } else {
+        format!(
+            "{} · ↑/↓ or j/k choose · Enter inspect · Esc/q back · h help",
+            app.status
+        )
+    };
+    render_status(frame, layout[3], &status, theme);
+}
+
+fn render_sbom_package_list(frame: &mut Frame<'_>, app: &App, theme: ThemeMode) {
+    let Screen::SbomPackageList {
+        sbom_id,
+        packages,
+        selected,
+        offset,
+        page_size,
+        total,
+        ..
+    } = &app.screen
+    else {
+        return;
+    };
+    let palette = theme.palette();
+    let log_pane_height = if app.log_pane_open {
+        Constraint::Length(5)
+    } else {
+        Constraint::Length(0)
+    };
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(5),
+            log_pane_height,
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+    render_banner_with_target(
+        frame,
+        layout[0],
+        &format!("Packages for SBOM {sbom_id}"),
+        &app.instance_label,
+        theme,
+    );
+    let items = packages
+        .iter()
+        .map(|package| ListItem::new(sbom_package_label(package)))
+        .collect::<Vec<_>>();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title("SBOM package inventory")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(palette.border))
+                .style(Style::default().fg(palette.foreground).bg(palette.surface)),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(palette.selection_foreground)
+                .bg(palette.selection)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("› ");
+    let mut state = ListState::default();
+    state.select((!packages.is_empty()).then_some(*selected));
+    frame.render_stateful_widget(list, layout[1], &mut state);
+    if app.log_pane_open {
+        render_log_pane(frame, layout[2], theme);
+    }
+    let page = *offset / (*page_size).max(1) + 1;
+    let page_count = total.map(|total| total.div_ceil(u64::from((*page_size).max(1))));
+    let page_label = page_count.map_or_else(
+        || format!("page {page}"),
+        |count| format!("page {page}/{count}"),
+    );
+    let base_status = format!(
+        "{page_label} · {} package(s) · n/p page · Esc/q back · h help",
+        packages.len()
+    );
+    let status = if app.status.is_empty() {
+        base_status
+    } else {
+        format!("{} · {base_status}", app.status)
+    };
+    render_status(frame, layout[3], &status, theme);
+}
+
+fn sbom_package_label(package: &Value) -> String {
+    if let Some(package) = package.as_str() {
+        return package.to_owned();
+    }
+    let name = first_value(package, &["name", "package_name", "purl", "id", "uuid"]);
+    let version = value_text(package.get("version"));
+    let purl = package
+        .get("purls")
+        .and_then(Value::as_array)
+        .and_then(|purls| purls.first())
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| value_text(package.get("purl")));
+    match (version.as_str(), purl.as_str()) {
+        ("—", "—") => name,
+        ("—", purl) => format!("{name} · {purl}"),
+        (version, "—") => format!("{name}@{version}"),
+        (version, purl) if purl == name => format!("{name}@{version}"),
+        (version, purl) => format!("{name}@{version} · {purl}"),
+    }
+}
+
 pub(super) fn render_log_pane(frame: &mut Frame<'_>, area: Rect, theme: ThemeMode) {
     let palette = theme.palette();
     let logs = crate::logging::recent_logs();
@@ -955,13 +1433,43 @@ fn list_status(app: &App) -> String {
         .as_ref()
         .map(|severities| format!(" · Severity: {}", severities.join(", ")))
         .unwrap_or_default();
+    let advisory_type_filter = app
+        .advisory_type_filter
+        .as_ref()
+        .map(|advisory_types| format!(" · Type: {}", advisory_types.join(", ")))
+        .unwrap_or_default();
+    let purl_filter = if app.resource == Some(ListResource::Package) {
+        let summary = app.purl_filter.summary();
+        if summary.is_empty() {
+            String::new()
+        } else {
+            format!(" · PURL filters: {summary}")
+        }
+    } else {
+        String::new()
+    };
     let severity_hint = if app.resource == Some(ListResource::Vulnerability) {
         " · f severity"
     } else {
         ""
     };
+    let advisory_type_hint = if app.resource == Some(ListResource::Advisory) {
+        " · f type"
+    } else {
+        ""
+    };
+    let purl_hint = if app.resource == Some(ListResource::Package) {
+        " · f PURL filters"
+    } else {
+        ""
+    };
+    let sbom_vulnerability_hint = if app.resource == Some(ListResource::Sbom) {
+        " · a vulnerabilities"
+    } else {
+        ""
+    };
     format!(
-        "{state}{sort}{date_range}{severity_filter} · j/k move · Enter open · n/p page · / search · s sort{date_hint}{severity_hint}{preview_hint}{log_hint} · h help · q back"
+        "{state}{sort}{date_range}{severity_filter}{advisory_type_filter}{purl_filter} · j/k move · Enter open · n/p page · / search · s sort{date_hint}{severity_hint}{advisory_type_hint}{purl_hint}{sbom_vulnerability_hint}{preview_hint}{log_hint} · h help · q back"
     )
 }
 
@@ -969,6 +1477,16 @@ fn sbom_id(item: &Value) -> Option<&str> {
     ["document_id", "id", "uuid"]
         .iter()
         .find_map(|field| item.get(*field).and_then(Value::as_str))
+}
+
+fn sbom_vulnerability_count(item: &Value) -> Option<u64> {
+    item.get("number_of_vulnerabilities")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            item.get("advisories")
+                .and_then(Value::as_object)
+                .map(|counts| counts.values().filter_map(Value::as_u64).sum())
+        })
 }
 
 fn sbom_display_id(item: &Value) -> String {
@@ -982,6 +1500,12 @@ fn sbom_display_id(item: &Value) -> String {
 }
 
 fn record_id(item: &Value, resource: Option<ListResource>) -> Option<&str> {
+    if resource == Some(ListResource::Product) {
+        return ["name", "vendor"]
+            .iter()
+            .find_map(|field| item.get(*field).and_then(Value::as_str));
+    }
+
     let preferred = match resource {
         Some(ListResource::Sbom) => [
             "document_id",
@@ -1028,7 +1552,7 @@ fn record_id(item: &Value, resource: Option<ListResource>) -> Option<&str> {
             "purl",
             "document_id",
         ],
-        Some(ListResource::Organization | ListResource::Product) => [
+        Some(ListResource::Organization) => [
             "name",
             "id",
             "uuid",
@@ -1153,7 +1677,7 @@ fn detail_fields(item: &Value, resource: Option<ListResource>) -> Vec<(String, S
             "metadata",
         ][..],
         Some(ListResource::Organization) => &["id", "name", "cpe_key", "website", "advisories"][..],
-        Some(ListResource::Product) => &["id", "name", "vendor", "versions"][..],
+        Some(ListResource::Product) => &["name", "vendor", "versions"][..],
         Some(ListResource::Weakness) => &[
             "id",
             "description",
@@ -1177,6 +1701,11 @@ fn detail_fields(item: &Value, resource: Option<ListResource>) -> Vec<(String, S
             fields.push((column_label(field), value_text(Some(value))));
         }
     }
+    if resource == Some(ListResource::Sbom) {
+        if let Some(count) = sbom_vulnerability_count(item) {
+            fields.push(("VULNERABILITIES".to_owned(), count.to_string()));
+        }
+    }
     if resource == Some(ListResource::Vulnerability) {
         if let Some(exploits) = item.get("exploits").and_then(Value::as_array) {
             if !exploits.is_empty() {
@@ -1188,6 +1717,14 @@ fn detail_fields(item: &Value, resource: Option<ListResource>) -> Vec<(String, S
         }
     }
     for (field, value) in object {
+        if resource == Some(ListResource::Product) && matches!(field.as_str(), "id" | "uuid") {
+            continue;
+        }
+        if resource == Some(ListResource::Sbom)
+            && matches!(field.as_str(), "advisories" | "number_of_vulnerabilities")
+        {
+            continue;
+        }
         if resource == Some(ListResource::Vulnerability) && field == "exploits" {
             continue;
         }
@@ -1196,6 +1733,20 @@ fn detail_fields(item: &Value, resource: Option<ListResource>) -> Vec<(String, S
         }
     }
     fields
+}
+
+fn add_sbom_vulnerability_count(fields: &mut Vec<(String, String)>, item: &Value, app: &App) {
+    let Some(count) = app.sbom_vulnerability_count_label(item) else {
+        return;
+    };
+    if let Some((_, value)) = fields
+        .iter_mut()
+        .find(|(label, _)| label == "VULNERABILITIES")
+    {
+        *value = count;
+    } else {
+        fields.push(("VULNERABILITIES".to_owned(), count));
+    }
 }
 
 fn column_label(column: &str) -> String {
@@ -1211,6 +1762,11 @@ fn record_value(item: &Value, column: &str) -> String {
                 .get("base_score")
                 .and_then(|base_score| base_score.get("severity"))
                 .filter(|value| !value.is_null())
+                .or_else(|| {
+                    highest_advisory_score(item)
+                        .and_then(|score| score.get("severity"))
+                        .filter(|value| !value.is_null())
+                })
                 .or_else(|| item.get("base_severity"))
                 .filter(|value| !value.is_null())
                 .or_else(|| item.get(column)),
@@ -1218,6 +1774,11 @@ fn record_value(item: &Value, column: &str) -> String {
                 .get("base_score")
                 .and_then(|base_score| base_score.get("score"))
                 .filter(|value| !value.is_null())
+                .or_else(|| {
+                    highest_advisory_score(item)
+                        .and_then(|score| score.get("value"))
+                        .filter(|value| !value.is_null())
+                })
                 .or_else(|| item.get(column)),
             "type" => item
                 .get("labels")
@@ -1234,6 +1795,36 @@ fn record_value(item: &Value, column: &str) -> String {
         }
         value
     }
+}
+
+fn highest_advisory_score(item: &Value) -> Option<&Value> {
+    item.get("vulnerabilities")?
+        .as_array()?
+        .iter()
+        .flat_map(|vulnerability| {
+            vulnerability
+                .get("scores")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .max_by(|left, right| {
+            let left_score = left
+                .get("value")
+                .and_then(score_as_f64)
+                .unwrap_or(f64::NEG_INFINITY);
+            let right_score = right
+                .get("value")
+                .and_then(score_as_f64)
+                .unwrap_or(f64::NEG_INFINITY);
+            left_score.total_cmp(&right_score)
+        })
+}
+
+fn score_as_f64(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.parse::<f64>().ok())
 }
 
 fn severity_style(severity: &str) -> Style {
@@ -1262,6 +1853,18 @@ fn severity_style(severity: &str) -> Style {
 }
 
 fn column_widths(columns: &[String], resource: Option<ListResource>) -> Vec<Constraint> {
+    if resource == Some(ListResource::Package) {
+        return columns
+            .iter()
+            .map(|column| match column.as_str() {
+                "purl" => Constraint::Fill(2),
+                "type" => Constraint::Length(14),
+                "version" => Constraint::Length(16),
+                "name" | "namespace" | "qualifiers" => Constraint::Fill(1),
+                _ => Constraint::Min(12),
+            })
+            .collect();
+    }
     if matches!(
         resource,
         Some(ListResource::Advisory | ListResource::Vulnerability)
@@ -1273,6 +1876,7 @@ fn column_widths(columns: &[String], resource: Option<ListResource>) -> Vec<Cons
                 "title" => Constraint::Fill(1),
                 "severity" => Constraint::Length(12),
                 "score" => Constraint::Length(8),
+                "known_exploit" => Constraint::Length(14),
                 "published" | "modified" => Constraint::Length(12),
                 _ => Constraint::Min(12),
             })
@@ -1463,7 +2067,8 @@ mod tests {
                 "severity".to_owned(),
                 "score".to_owned(),
                 "published".to_owned(),
-                "modified".to_owned()
+                "modified".to_owned(),
+                "known_exploit".to_owned()
             ])
         );
         assert_eq!(record_value(&item, "severity"), "CRITICAL");
@@ -1484,11 +2089,24 @@ mod tests {
     }
 
     #[test]
-    fn advisory_type_is_rendered_from_labels() {
+    fn advisory_type_and_base_score_are_rendered() {
         let item = serde_json::json!({
             "document_id": "GHSA-abcd-1234",
             "title": "Example advisory",
-            "labels": {"type": "cve"}
+            "labels": {"type": "cve"},
+            "vulnerabilities": [
+                {
+                    "head": {"identifier": "CVE-2025-0001"},
+                    "scores": [
+                        {"type": "3.1", "value": 7.5, "severity": "HIGH"},
+                        {"type": "4.0", "value": 9.8, "severity": "CRITICAL"}
+                    ]
+                },
+                {
+                    "head": {"identifier": "CVE-2025-0002"},
+                    "scores": [{"type": "3.1", "value": 8.1, "severity": "HIGH"}]
+                }
+            ]
         });
         let app = App::records(
             serde_json::json!({"items": [item.clone()]}),
@@ -1505,9 +2123,13 @@ mod tests {
                 "document_id".to_owned(),
                 "title".to_owned(),
                 "type".to_owned(),
+                "severity".to_owned(),
+                "score".to_owned(),
             ])
         );
         assert_eq!(record_value(&item, "type"), "cve");
+        assert_eq!(record_value(&item, "severity"), "CRITICAL");
+        assert_eq!(record_value(&item, "score"), "9.8");
     }
 
     #[test]
@@ -1533,6 +2155,30 @@ mod tests {
                 ("TITLE".to_owned(), "Example advisory".to_owned()),
                 ("PUBLISHED".to_owned(), "2026-01-02".to_owned()),
                 ("EXTRA FIELD".to_owned(), "retained".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn product_details_hide_internal_identifiers() {
+        let item = serde_json::json!({
+            "id": "internal-id",
+            "uuid": "product-uuid",
+            "name": "OpenJDK",
+            "vendor": "Red Hat",
+            "versions": ["17"]
+        });
+
+        assert_eq!(
+            record_id(&item, Some(ListResource::Product)),
+            Some("OpenJDK")
+        );
+        assert_eq!(
+            detail_fields(&item, Some(ListResource::Product)),
+            vec![
+                ("NAME".to_owned(), "OpenJDK".to_owned()),
+                ("VENDOR".to_owned(), "Red Hat".to_owned()),
+                ("VERSIONS".to_owned(), "17".to_owned()),
             ]
         );
     }

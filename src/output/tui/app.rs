@@ -1,13 +1,29 @@
 use chrono::{Duration, NaiveDate, Utc};
 use crossterm::event::KeyCode;
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 
 use crate::api::{sbom::ListParams, ListResource};
 
 use super::theme::ThemeMode;
 
-pub(super) const SEVERITY_FILTER_OPTIONS: [&str; 6] =
-    ["critical", "high", "medium", "low", "none", "unknown"];
+pub(super) use crate::settings::SEVERITY_FILTER_OPTIONS;
+pub(super) const ADVISORY_TYPE_FILTER_OPTIONS: [&str; 13] = [
+    "cve",
+    "csaf",
+    "advisory",
+    "clearlydefined",
+    "clearlydefinedcuration",
+    "cisakev",
+    "cyclonedx",
+    "cwecatalog",
+    "nvd",
+    "osv",
+    "sbom",
+    "spdx",
+    "unknown",
+];
+pub(super) const PURL_FILTER_FIELD_COUNT: usize = 6;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DateRange {
@@ -130,12 +146,98 @@ fn is_valid_date(date: &str) -> bool {
     (1..=days_in_month).contains(&day)
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PurlFilter {
+    pub ecosystem: String,
+    pub architecture: String,
+    pub distribution: String,
+    pub repository_url: String,
+    pub custom_qualifier_name: String,
+    pub custom_qualifier_value: String,
+}
+
+impl PurlFilter {
+    fn query_constraints(&self) -> Vec<String> {
+        let mut constraints = Vec::new();
+        for (field, value) in [
+            ("type", self.ecosystem.trim()),
+            ("arch", self.architecture.trim()),
+            ("distro", self.distribution.trim()),
+            ("purl:qualifiers:repository_url", self.repository_url.trim()),
+        ] {
+            if !value.is_empty() {
+                constraints.push(format!("{field}={}", escape_query_value(value)));
+            }
+        }
+
+        let qualifier_name = self.custom_qualifier_name.trim();
+        let qualifier_value = self.custom_qualifier_value.trim();
+        if !qualifier_name.is_empty() && !qualifier_value.is_empty() {
+            constraints.push(format!(
+                "purl:qualifiers:{qualifier_name}={}",
+                escape_query_value(qualifier_value)
+            ));
+        }
+        constraints
+    }
+
+    fn field_mut(&mut self, selected: usize) -> Option<&mut String> {
+        match selected {
+            0 => Some(&mut self.ecosystem),
+            1 => Some(&mut self.architecture),
+            2 => Some(&mut self.distribution),
+            3 => Some(&mut self.repository_url),
+            4 => Some(&mut self.custom_qualifier_name),
+            5 => Some(&mut self.custom_qualifier_value),
+            _ => None,
+        }
+    }
+
+    pub(super) fn summary(&self) -> String {
+        let mut filters = Vec::new();
+        for (label, value) in [
+            ("ecosystem", self.ecosystem.trim()),
+            ("arch", self.architecture.trim()),
+            ("distro", self.distribution.trim()),
+            ("repository_url", self.repository_url.trim()),
+        ] {
+            if !value.is_empty() {
+                filters.push(format!("{label}={value}"));
+            }
+        }
+        if !self.custom_qualifier_name.trim().is_empty()
+            && !self.custom_qualifier_value.trim().is_empty()
+        {
+            filters.push(format!(
+                "{}={}",
+                self.custom_qualifier_name.trim(),
+                self.custom_qualifier_value.trim()
+            ));
+        }
+        filters.join(", ")
+    }
+}
+
+fn escape_query_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '&' | '|' | '=' | '!' | '~' | '>' | '<' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
 pub struct App {
     pub items: Vec<Value>,
     pub title: String,
     pub item_title: String,
     pub resource: Option<ListResource>,
     pub columns: Option<Vec<String>>,
+    pub known_exploits: HashMap<String, KnownExploitStatus>,
+    pub sbom_vulnerability_counts: HashMap<String, SbomVulnerabilityCountStatus>,
+    pub sbom_vulnerabilities: HashMap<String, Vec<Value>>,
     pub selected: usize,
     pub offset: u32,
     pub page_size: u32,
@@ -150,12 +252,47 @@ pub struct App {
     pub severity_filter_open: bool,
     pub severity_filter_selected: usize,
     pub severity_filter_draft: Vec<String>,
+    pub advisory_type_filter: Option<Vec<String>>,
+    pub advisory_type_filter_open: bool,
+    pub advisory_type_filter_selected: usize,
+    pub advisory_type_filter_draft: Vec<String>,
+    pub purl_filter: PurlFilter,
+    pub purl_filter_open: bool,
+    pub purl_filter_draft: PurlFilter,
+    pub purl_filter_selected: usize,
+    pub purl_filter_editing: bool,
     pub log_pane_open: bool,
     pub preview_pane_open: bool,
     pub help_open: bool,
     pub instance_label: String,
     pub theme: ThemeMode,
     pub screen: Screen,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KnownExploitStatus {
+    Checking,
+    Present,
+    Absent,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SbomVulnerabilityCountStatus {
+    Checking,
+    Available(u64),
+    Unavailable,
+}
+
+impl KnownExploitStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Checking => "Checking",
+            Self::Present => "Yes",
+            Self::Absent => "No",
+            Self::Unavailable => "Error",
+        }
+    }
 }
 
 pub enum Screen {
@@ -177,6 +314,21 @@ pub enum Screen {
         selected: usize,
         previous: Box<Screen>,
     },
+    SbomVulnerabilityList {
+        sbom_id: String,
+        vulnerabilities: Vec<Value>,
+        selected: usize,
+        previous: Box<Screen>,
+    },
+    SbomPackageList {
+        sbom_id: String,
+        packages: Vec<Value>,
+        selected: usize,
+        offset: u32,
+        page_size: u32,
+        total: Option<u64>,
+        previous: Box<Screen>,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -191,6 +343,12 @@ pub enum Action {
     Sort(Option<String>),
     SetDateRange(Option<DateRange>),
     SetSeverityFilter(Option<Vec<String>>),
+    SetAdvisoryTypeFilter(Option<Vec<String>>),
+    SetPurlFilter(PurlFilter),
+    SetPreviewPaneOpen(bool),
+    BrowseSbomVulnerabilities(String),
+    BrowseSbomPackages(String),
+    LoadSbomPackagePage { sbom_id: String, offset: u32 },
     BrowseCwes(Vec<String>),
     BrowseExploits(String),
     OpenWeakness(String),
@@ -259,6 +417,9 @@ impl App {
             item_title: item_title.to_owned(),
             resource,
             columns,
+            known_exploits: HashMap::new(),
+            sbom_vulnerability_counts: HashMap::new(),
+            sbom_vulnerabilities: HashMap::new(),
             selected: 0,
             offset,
             page_size,
@@ -272,6 +433,15 @@ impl App {
             severity_filter_open: false,
             severity_filter_selected: 0,
             severity_filter_draft: Vec::new(),
+            advisory_type_filter: None,
+            advisory_type_filter_open: false,
+            advisory_type_filter_selected: 0,
+            advisory_type_filter_draft: Vec::new(),
+            purl_filter: PurlFilter::default(),
+            purl_filter_open: false,
+            purl_filter_draft: PurlFilter::default(),
+            purl_filter_selected: 0,
+            purl_filter_editing: false,
             log_pane_open: crate::logging::debug_mode_enabled(),
             preview_pane_open: true,
             help_open: false,
@@ -300,6 +470,9 @@ impl App {
             item_title: title.to_owned(),
             resource,
             columns: None,
+            known_exploits: HashMap::new(),
+            sbom_vulnerability_counts: HashMap::new(),
+            sbom_vulnerabilities: HashMap::new(),
             selected: 0,
             offset: 0,
             page_size: 1,
@@ -314,6 +487,15 @@ impl App {
             severity_filter_open: false,
             severity_filter_selected: 0,
             severity_filter_draft: Vec::new(),
+            advisory_type_filter: None,
+            advisory_type_filter_open: false,
+            advisory_type_filter_selected: 0,
+            advisory_type_filter_draft: Vec::new(),
+            purl_filter: PurlFilter::default(),
+            purl_filter_open: false,
+            purl_filter_draft: PurlFilter::default(),
+            purl_filter_selected: 0,
+            purl_filter_editing: false,
             log_pane_open: crate::logging::debug_mode_enabled(),
             preview_pane_open: false,
             help_open: false,
@@ -373,6 +555,14 @@ impl App {
                 constraints.push(format!("base_severity={}", severities.join("|")));
             }
         }
+        if let Some(advisory_types) = &self.advisory_type_filter {
+            if !advisory_types.is_empty() {
+                constraints.push(format!("labels:type={}", advisory_types.join("|")));
+            }
+        }
+        if self.resource == Some(ListResource::Package) {
+            constraints.extend(self.purl_filter.query_constraints());
+        }
         (!constraints.is_empty()).then(|| constraints.join("&"))
     }
 
@@ -406,6 +596,103 @@ impl App {
         self.selected = 0;
         self.status.clear();
         Ok(true)
+    }
+
+    pub fn pending_sbom_vulnerability_checks(&mut self) -> Vec<String> {
+        if self.resource != Some(ListResource::Sbom) {
+            return Vec::new();
+        }
+
+        let candidates = self
+            .items
+            .iter()
+            .filter(|item| {
+                item.get("number_of_vulnerabilities")
+                    .and_then(Value::as_u64)
+                    .is_none()
+                    && item.get("advisories").and_then(Value::as_object).is_none()
+            })
+            .filter_map(sbom_record_id)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut seen = HashSet::new();
+        let mut pending = Vec::new();
+        for sbom_id in candidates {
+            if seen.insert(sbom_id.clone())
+                && !self.sbom_vulnerability_counts.contains_key(&sbom_id)
+            {
+                self.sbom_vulnerability_counts
+                    .insert(sbom_id.clone(), SbomVulnerabilityCountStatus::Checking);
+                pending.push(sbom_id);
+            }
+        }
+        pending
+    }
+
+    pub fn set_sbom_vulnerability_result(
+        &mut self,
+        sbom_id: String,
+        result: Result<Vec<Value>, String>,
+    ) {
+        match result {
+            Ok(vulnerabilities) => {
+                self.sbom_vulnerability_counts.insert(
+                    sbom_id.clone(),
+                    SbomVulnerabilityCountStatus::Available(vulnerabilities.len() as u64),
+                );
+                self.sbom_vulnerabilities.insert(sbom_id, vulnerabilities);
+            }
+            Err(_) => {
+                self.sbom_vulnerability_counts
+                    .insert(sbom_id, SbomVulnerabilityCountStatus::Unavailable);
+            }
+        }
+    }
+
+    pub fn sbom_vulnerabilities(&self, sbom_id: &str) -> Option<&[Value]> {
+        self.sbom_vulnerabilities.get(sbom_id).map(Vec::as_slice)
+    }
+
+    pub fn sbom_vulnerability_count_label(&self, item: &Value) -> Option<String> {
+        let sbom_id = sbom_record_id(item)?;
+        match self.sbom_vulnerability_counts.get(sbom_id)? {
+            SbomVulnerabilityCountStatus::Checking => Some("…".to_owned()),
+            SbomVulnerabilityCountStatus::Available(count) => Some(count.to_string()),
+            SbomVulnerabilityCountStatus::Unavailable => Some("!".to_owned()),
+        }
+    }
+
+    pub fn pending_known_exploit_checks(&mut self) -> Vec<String> {
+        if self.resource != Some(ListResource::Vulnerability) {
+            return Vec::new();
+        }
+
+        let mut seen = HashSet::new();
+        let cve_ids = self
+            .items
+            .iter()
+            .filter_map(vulnerability_cve_id)
+            .filter(|cve_id| {
+                !self.known_exploits.contains_key(*cve_id) && seen.insert((*cve_id).to_owned())
+            })
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        for cve_id in &cve_ids {
+            self.known_exploits
+                .insert(cve_id.clone(), KnownExploitStatus::Checking);
+        }
+        cve_ids
+    }
+
+    pub fn set_known_exploit_status(&mut self, cve_id: String, status: KnownExploitStatus) {
+        self.known_exploits.insert(cve_id, status);
+    }
+
+    pub fn known_exploit_label(&self, item: &Value) -> &'static str {
+        vulnerability_cve_id(item)
+            .and_then(|cve_id| self.known_exploits.get(cve_id))
+            .copied()
+            .map_or("—", KnownExploitStatus::label)
     }
 
     pub fn selected_id(&self) -> Option<&str> {
@@ -466,6 +753,77 @@ impl App {
         self.status.clear();
     }
 
+    pub fn open_sbom_vulnerability_list(&mut self, sbom_id: String, vulnerabilities: Vec<Value>) {
+        if vulnerabilities.is_empty() {
+            self.status = format!("No vulnerabilities found for SBOM {sbom_id}");
+            return;
+        }
+        let previous = std::mem::replace(&mut self.screen, Screen::List);
+        self.screen = Screen::SbomVulnerabilityList {
+            sbom_id,
+            vulnerabilities,
+            selected: 0,
+            previous: Box::new(previous),
+        };
+        self.status.clear();
+    }
+
+    pub fn open_sbom_package_list(
+        &mut self,
+        sbom_id: String,
+        response: Value,
+        page_size: u32,
+    ) -> anyhow::Result<()> {
+        let packages = response
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("SBOM package response has no items array"))?;
+        let total = response.get("total").and_then(Value::as_u64);
+        let previous = std::mem::replace(&mut self.screen, Screen::List);
+        self.screen = Screen::SbomPackageList {
+            sbom_id,
+            packages,
+            selected: 0,
+            offset: 0,
+            page_size: page_size.max(1),
+            total,
+            previous: Box::new(previous),
+        };
+        self.status.clear();
+        Ok(())
+    }
+
+    pub fn set_sbom_package_page(&mut self, response: Value, offset: u32) -> anyhow::Result<bool> {
+        let packages = response
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("SBOM package response has no items array"))?;
+        let total = response.get("total").and_then(Value::as_u64);
+        let Screen::SbomPackageList {
+            packages: current_packages,
+            offset: current_offset,
+            total: current_total,
+            selected,
+            ..
+        } = &mut self.screen
+        else {
+            return Ok(false);
+        };
+        if packages.is_empty() && offset > *current_offset {
+            return Ok(false);
+        }
+        *current_packages = packages;
+        if let Some(total) = total {
+            *current_total = Some(total);
+        }
+        *current_offset = offset;
+        *selected = 0;
+        self.status.clear();
+        Ok(true)
+    }
+
     pub fn open_linked_details(&mut self, title: &str, item: Value, resource: ListResource) {
         let previous = std::mem::replace(&mut self.screen, Screen::List);
         self.screen = Screen::Detail {
@@ -486,7 +844,9 @@ impl App {
                 ..
             }
             | Screen::CweList { previous, .. }
-            | Screen::ExploitList { previous, .. } => *previous,
+            | Screen::ExploitList { previous, .. }
+            | Screen::SbomVulnerabilityList { previous, .. }
+            | Screen::SbomPackageList { previous, .. } => *previous,
             Screen::Detail { .. } | Screen::List => Screen::List,
         };
         self.status.clear();
@@ -619,6 +979,113 @@ impl App {
             return Action::None;
         }
 
+        if self.advisory_type_filter_open {
+            match key {
+                KeyCode::Esc => self.advisory_type_filter_open = false,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.advisory_type_filter_selected =
+                        self.advisory_type_filter_selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.advisory_type_filter_selected + 1 < ADVISORY_TYPE_FILTER_OPTIONS.len() {
+                        self.advisory_type_filter_selected += 1;
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    let advisory_type =
+                        ADVISORY_TYPE_FILTER_OPTIONS[self.advisory_type_filter_selected];
+                    if let Some(index) = self
+                        .advisory_type_filter_draft
+                        .iter()
+                        .position(|selected| selected == advisory_type)
+                    {
+                        self.advisory_type_filter_draft.remove(index);
+                    } else {
+                        self.advisory_type_filter_draft
+                            .push(advisory_type.to_owned());
+                    }
+                }
+                KeyCode::Char('a') => {
+                    if self.advisory_type_filter_draft.len() == ADVISORY_TYPE_FILTER_OPTIONS.len() {
+                        self.advisory_type_filter_draft.clear();
+                    } else {
+                        self.advisory_type_filter_draft = ADVISORY_TYPE_FILTER_OPTIONS
+                            .iter()
+                            .map(|advisory_type| (*advisory_type).to_owned())
+                            .collect();
+                    }
+                }
+                KeyCode::Enter => {
+                    self.advisory_type_filter_open = false;
+                    let advisory_types = ADVISORY_TYPE_FILTER_OPTIONS
+                        .iter()
+                        .filter(|advisory_type| {
+                            self.advisory_type_filter_draft
+                                .iter()
+                                .any(|selected| selected == **advisory_type)
+                        })
+                        .map(|advisory_type| (*advisory_type).to_owned())
+                        .collect::<Vec<_>>();
+                    let filter = (!advisory_types.is_empty()
+                        && advisory_types.len() != ADVISORY_TYPE_FILTER_OPTIONS.len())
+                    .then_some(advisory_types);
+                    if filter != self.advisory_type_filter {
+                        self.advisory_type_filter = filter.clone();
+                        return Action::SetAdvisoryTypeFilter(filter);
+                    }
+                }
+                _ => {}
+            }
+            return Action::None;
+        }
+
+        if self.purl_filter_open {
+            if self.purl_filter_editing {
+                match key {
+                    KeyCode::Esc | KeyCode::Enter => self.purl_filter_editing = false,
+                    KeyCode::Backspace => {
+                        if let Some(value) =
+                            self.purl_filter_draft.field_mut(self.purl_filter_selected)
+                        {
+                            value.pop();
+                        }
+                    }
+                    KeyCode::Char(character) if !character.is_control() => {
+                        if let Some(value) =
+                            self.purl_filter_draft.field_mut(self.purl_filter_selected)
+                        {
+                            value.push(character);
+                        }
+                    }
+                    _ => {}
+                }
+                return Action::None;
+            }
+
+            match key {
+                KeyCode::Esc => self.purl_filter_open = false,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.purl_filter_selected = self.purl_filter_selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.purl_filter_selected + 1 < PURL_FILTER_FIELD_COUNT {
+                        self.purl_filter_selected += 1;
+                    }
+                }
+                KeyCode::Enter => self.purl_filter_editing = true,
+                KeyCode::Char('c') => self.purl_filter_draft = PurlFilter::default(),
+                KeyCode::Char('a') => {
+                    self.purl_filter_open = false;
+                    if self.purl_filter != self.purl_filter_draft {
+                        self.purl_filter = self.purl_filter_draft.clone();
+                        return Action::SetPurlFilter(self.purl_filter.clone());
+                    }
+                }
+                _ => {}
+            }
+            return Action::None;
+        }
+
         if self.help_open {
             if matches!(
                 key,
@@ -685,6 +1152,78 @@ impl App {
             return Action::None;
         }
 
+        if let Screen::SbomVulnerabilityList {
+            vulnerabilities,
+            selected,
+            ..
+        } = &mut self.screen
+        {
+            match key {
+                KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q') => return Action::Back,
+                KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if *selected + 1 < vulnerabilities.len() {
+                        *selected += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(identifier) = vulnerabilities
+                        .get(*selected)
+                        .and_then(|vulnerability| {
+                            vulnerability
+                                .get("identifier")
+                                .or_else(|| vulnerability.get("id"))
+                        })
+                        .and_then(Value::as_str)
+                    {
+                        return Action::OpenVulnerability(identifier.to_owned());
+                    }
+                    self.status = "Vulnerability has no identifier".to_owned();
+                }
+                _ => {}
+            }
+            return Action::None;
+        }
+
+        if let Screen::SbomPackageList {
+            packages,
+            selected,
+            sbom_id,
+            offset,
+            page_size,
+            total,
+            ..
+        } = &mut self.screen
+        {
+            match key {
+                KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q') => return Action::Back,
+                KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if *selected + 1 < packages.len() {
+                        *selected += 1;
+                    }
+                }
+                KeyCode::Right | KeyCode::PageDown | KeyCode::Char('n')
+                    if total.is_some_and(|total| {
+                        u64::from(*offset) + (packages.len() as u64) < total
+                    }) || packages.len() >= *page_size as usize =>
+                {
+                    return Action::LoadSbomPackagePage {
+                        sbom_id: sbom_id.clone(),
+                        offset: offset.saturating_add(*page_size),
+                    }
+                }
+                KeyCode::Left | KeyCode::PageUp | KeyCode::Char('p') if *offset > 0 => {
+                    return Action::LoadSbomPackagePage {
+                        sbom_id: sbom_id.clone(),
+                        offset: offset.saturating_sub(*page_size),
+                    }
+                }
+                _ => {}
+            }
+            return Action::None;
+        }
+
         if let Screen::Detail {
             item,
             scroll,
@@ -705,6 +1244,24 @@ impl App {
                 KeyCode::Char('l') => self.log_pane_open = !self.log_pane_open,
                 KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => *scroll = scroll.saturating_add(1),
+                KeyCode::Char('v') if *resource == Some(ListResource::Sbom) => {
+                    if let Some(id) = ["id", "uuid", "identifier", "document_id"]
+                        .iter()
+                        .find_map(|field| item.get(*field).and_then(Value::as_str))
+                    {
+                        return Action::BrowseSbomVulnerabilities(id.to_owned());
+                    }
+                    self.status = "SBOM has no identifier".to_owned();
+                }
+                KeyCode::Char('p') if *resource == Some(ListResource::Sbom) => {
+                    if let Some(id) = ["id", "uuid", "identifier", "document_id"]
+                        .iter()
+                        .find_map(|field| item.get(*field).and_then(Value::as_str))
+                    {
+                        return Action::BrowseSbomPackages(id.to_owned());
+                    }
+                    self.status = "SBOM has no identifier".to_owned();
+                }
                 KeyCode::Char('c') if *resource == Some(ListResource::Vulnerability) => {
                     if let Some(id) = cwe_ids(item).into_iter().next() {
                         return Action::OpenWeakness(id);
@@ -759,6 +1316,14 @@ impl App {
             KeyCode::Left | KeyCode::PageUp | KeyCode::Char('p') if self.offset > 0 => {
                 Action::PreviousPage
             }
+            KeyCode::Char('a') if self.resource == Some(ListResource::Sbom) => {
+                if let Some(sbom_id) = self.selected_id() {
+                    Action::BrowseSbomVulnerabilities(sbom_id.to_owned())
+                } else {
+                    self.status = "SBOM has no identifier".to_owned();
+                    Action::None
+                }
+            }
             KeyCode::Enter if !self.items.is_empty() => Action::OpenDetails,
             KeyCode::Char('/') => {
                 self.search_input = Some(self.params.query.clone().unwrap_or_default());
@@ -789,17 +1354,42 @@ impl App {
                 self.severity_filter_open = true;
                 Action::None
             }
+            KeyCode::Char('f') if self.resource == Some(ListResource::Advisory) => {
+                self.advisory_type_filter_selected = 0;
+                self.advisory_type_filter_draft =
+                    self.advisory_type_filter.clone().unwrap_or_else(|| {
+                        ADVISORY_TYPE_FILTER_OPTIONS
+                            .iter()
+                            .map(|advisory_type| (*advisory_type).to_owned())
+                            .collect()
+                    });
+                self.advisory_type_filter_open = true;
+                Action::None
+            }
+            KeyCode::Char('f') if self.resource == Some(ListResource::Package) => {
+                self.purl_filter_draft = self.purl_filter.clone();
+                self.purl_filter_selected = 0;
+                self.purl_filter_editing = false;
+                self.purl_filter_open = true;
+                Action::None
+            }
             KeyCode::Char('l') => {
                 self.log_pane_open = !self.log_pane_open;
                 Action::None
             }
             KeyCode::Char('v') => {
                 self.preview_pane_open = !self.preview_pane_open;
-                Action::None
+                Action::SetPreviewPaneOpen(self.preview_pane_open)
             }
             _ => Action::None,
         }
     }
+}
+
+fn sbom_record_id(item: &Value) -> Option<&str> {
+    ["id", "uuid", "document_id", "identifier"]
+        .iter()
+        .find_map(|field| item.get(*field).and_then(Value::as_str))
 }
 
 fn cwe_ids(item: &Value) -> Vec<String> {
@@ -818,7 +1408,35 @@ fn cwe_ids(item: &Value) -> Vec<String> {
 fn record_columns(items: &[Value], resource: ListResource) -> Vec<String> {
     let Some(object) = items.iter().find_map(Value::as_object) else {
         if resource == ListResource::Vulnerability {
-            return ["id", "title", "severity", "score", "published", "modified"]
+            return [
+                "id",
+                "title",
+                "severity",
+                "score",
+                "published",
+                "modified",
+                "known_exploit",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        }
+        if resource == ListResource::Advisory {
+            return [
+                "document_id",
+                "title",
+                "type",
+                "severity",
+                "score",
+                "published",
+                "modified",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        }
+        if resource == ListResource::Package {
+            return ["purl", "type", "namespace", "name", "version"]
                 .into_iter()
                 .map(str::to_owned)
                 .collect();
@@ -850,10 +1468,41 @@ fn record_columns(items: &[Value], resource: ListResource) -> Vec<String> {
             "score",
             "published",
             "modified",
+            "known_exploit",
         ]
         .into_iter()
         .map(str::to_owned)
         .collect();
+    }
+
+    if resource == ListResource::Package {
+        let identity = ["purl", "name", "id", "identifier", "document_id"]
+            .iter()
+            .find(|field| contains_value(field))
+            .copied()
+            .unwrap_or("purl");
+        let mut columns = vec![identity.to_owned()];
+        for field in ["type", "namespace", "name", "version", "qualifiers"] {
+            if columns.len() == 5 {
+                break;
+            }
+            if !columns.iter().any(|column| column == field) && contains_value(field) {
+                columns.push(field.to_owned());
+            }
+        }
+        return columns;
+    }
+
+    if resource == ListResource::Product {
+        let mut columns = ["name", "vendor", "versions"]
+            .into_iter()
+            .filter(|field| contains_value(field))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if columns.is_empty() {
+            columns.push("name".to_owned());
+        }
+        return columns;
     }
 
     let identity_fields = if resource == ListResource::Advisory {
@@ -887,6 +1536,7 @@ fn record_columns(items: &[Value], resource: ListResource) -> Vec<String> {
                 columns.push(field.to_owned());
             }
         }
+        columns.extend(["severity", "score"].map(str::to_owned));
     }
     for field in [
         "title",
@@ -926,6 +1576,23 @@ fn record_columns(items: &[Value], resource: ListResource) -> Vec<String> {
     columns
 }
 
+fn vulnerability_cve_id(item: &Value) -> Option<&str> {
+    ["identifier", "id"]
+        .iter()
+        .find_map(|field| {
+            item.get(*field)
+                .and_then(Value::as_str)
+                .filter(|value| value.starts_with("CVE-"))
+        })
+        .or_else(|| {
+            item.get("aliases")
+                .and_then(Value::as_array)?
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|alias| alias.starts_with("CVE-"))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -957,6 +1624,112 @@ mod tests {
         assert_eq!(app.handle_key(KeyCode::Esc), Action::Back);
         app.go_back();
         assert!(matches!(app.screen, Screen::List));
+    }
+
+    #[test]
+    fn sbom_details_open_vulnerability_and_package_lists() {
+        let mut app = app();
+        assert_eq!(
+            app.handle_key(KeyCode::Char('a')),
+            Action::BrowseSbomVulnerabilities("sbom-1".to_owned())
+        );
+
+        app.open_details(serde_json::json!({"id": "sbom-1"}));
+
+        assert_eq!(
+            app.handle_key(KeyCode::Char('v')),
+            Action::BrowseSbomVulnerabilities("sbom-1".to_owned())
+        );
+        assert_eq!(
+            app.handle_key(KeyCode::Char('p')),
+            Action::BrowseSbomPackages("sbom-1".to_owned())
+        );
+    }
+
+    #[test]
+    fn sbom_package_list_pages_and_returns_to_its_previous_screen() {
+        let mut app = app();
+        app.open_sbom_package_list(
+            "sbom-1".to_owned(),
+            serde_json::json!({"items": [{"name": "first"}], "total": 3}),
+            1,
+        )
+        .expect("valid package response");
+
+        assert_eq!(
+            app.handle_key(KeyCode::Char('n')),
+            Action::LoadSbomPackagePage {
+                sbom_id: "sbom-1".to_owned(),
+                offset: 1,
+            }
+        );
+        assert!(app
+            .set_sbom_package_page(
+                serde_json::json!({"items": [{"name": "second"}], "total": 3}),
+                1,
+            )
+            .expect("valid next page"));
+        assert_eq!(app.handle_key(KeyCode::Esc), Action::Back);
+        app.go_back();
+        assert!(matches!(app.screen, Screen::List));
+    }
+
+    #[test]
+    fn sbom_vulnerability_counts_update_rows_individually_and_are_cached_by_id() {
+        let mut app = App::new(
+            serde_json::json!({
+                "items": [
+                    {"id": "sbom-1", "name": "First"},
+                    {"id": "sbom-2", "name": "Second"},
+                    {"id": "sbom-3", "number_of_vulnerabilities": 7}
+                ]
+            }),
+            ListParams::default(),
+            3,
+        )
+        .expect("valid SBOM page");
+
+        assert_eq!(
+            app.pending_sbom_vulnerability_checks(),
+            ["sbom-1", "sbom-2"]
+        );
+        assert!(app.pending_sbom_vulnerability_checks().is_empty());
+        assert_eq!(
+            app.sbom_vulnerability_count_label(&app.items[0]).as_deref(),
+            Some("…")
+        );
+
+        app.set_sbom_vulnerability_result(
+            "sbom-2".to_owned(),
+            Ok(vec![
+                serde_json::json!({"identifier": "CVE-1"}),
+                serde_json::json!({"identifier": "CVE-2"}),
+                serde_json::json!({"identifier": "CVE-3"}),
+                serde_json::json!({"identifier": "CVE-4"}),
+            ]),
+        );
+        assert_eq!(
+            app.sbom_vulnerability_count_label(&app.items[1]).as_deref(),
+            Some("4")
+        );
+        assert_eq!(app.sbom_vulnerabilities("sbom-2").unwrap().len(), 4);
+        app.set_sbom_vulnerability_result("sbom-1".to_owned(), Err("offline".to_owned()));
+        assert_eq!(
+            app.sbom_vulnerability_count_label(&app.items[0]).as_deref(),
+            Some("!")
+        );
+
+        assert!(app
+            .set_page(
+                serde_json::json!({"items": [{"id": "sbom-2"}, {"id": "sbom-4"}]}),
+                3,
+            )
+            .expect("valid next SBOM page"));
+        assert_eq!(
+            app.sbom_vulnerability_count_label(&app.items[0]).as_deref(),
+            Some("4")
+        );
+        assert_eq!(app.pending_sbom_vulnerability_checks(), ["sbom-4"]);
     }
 
     #[test]
@@ -1082,6 +1855,37 @@ mod tests {
     }
 
     #[test]
+    fn known_exploit_checks_deduplicate_cves_and_update_the_row_label() {
+        let mut app = App::records(
+            serde_json::json!({
+                "items": [
+                    {"identifier": "CVE-2025-1234"},
+                    {"id": "CVE-2025-1234"},
+                    {"identifier": "GHSA-abcd-1234", "aliases": ["CVE-2025-5678"]},
+                    {"identifier": "GHSA-efgh-5678"}
+                ]
+            }),
+            ListParams::default(),
+            20,
+            "Vulnerabilities",
+            ListResource::Vulnerability,
+        )
+        .expect("valid vulnerability page");
+
+        assert_eq!(
+            app.pending_known_exploit_checks(),
+            ["CVE-2025-1234", "CVE-2025-5678"]
+        );
+        assert_eq!(app.known_exploit_label(&app.items[0]), "Checking");
+
+        app.set_known_exploit_status("CVE-2025-1234".to_owned(), KnownExploitStatus::Present);
+        app.set_known_exploit_status("CVE-2025-5678".to_owned(), KnownExploitStatus::Absent);
+        assert_eq!(app.known_exploit_label(&app.items[0]), "Yes");
+        assert_eq!(app.known_exploit_label(&app.items[2]), "No");
+        assert!(app.pending_known_exploit_checks().is_empty());
+    }
+
+    #[test]
     fn log_pane_can_be_toggled_from_list_and_detail_screens() {
         let mut app = app();
         let initial_visibility = app.log_pane_open;
@@ -1099,9 +1903,15 @@ mod tests {
         let mut app = app();
         assert!(app.preview_pane_open);
 
-        assert_eq!(app.handle_key(KeyCode::Char('v')), Action::None);
+        assert_eq!(
+            app.handle_key(KeyCode::Char('v')),
+            Action::SetPreviewPaneOpen(false)
+        );
         assert!(!app.preview_pane_open);
-        assert_eq!(app.handle_key(KeyCode::Char('v')), Action::None);
+        assert_eq!(
+            app.handle_key(KeyCode::Char('v')),
+            Action::SetPreviewPaneOpen(true)
+        );
         assert!(app.preview_pane_open);
     }
 
@@ -1169,6 +1979,107 @@ mod tests {
         assert_eq!(
             app.list_query().as_deref(),
             Some(format!("base_severity={}", expected.join("|")).as_str())
+        );
+    }
+
+    #[test]
+    fn advisory_type_filter_emits_cve_and_csaf_query() {
+        let mut app = App::records(
+            serde_json::json!({"items": [{"id": "CVE-2025-1234"}]}),
+            ListParams::default(),
+            20,
+            "Advisories",
+            ListResource::Advisory,
+        )
+        .expect("valid advisory page");
+
+        assert_eq!(app.handle_key(KeyCode::Char('f')), Action::None);
+        assert!(app.advisory_type_filter_open);
+        assert_eq!(app.handle_key(KeyCode::Char('a')), Action::None);
+        assert_eq!(app.handle_key(KeyCode::Char(' ')), Action::None);
+        assert_eq!(app.handle_key(KeyCode::Down), Action::None);
+        assert_eq!(app.handle_key(KeyCode::Char(' ')), Action::None);
+
+        let expected = vec!["cve".to_owned(), "csaf".to_owned()];
+        assert_eq!(
+            app.handle_key(KeyCode::Enter),
+            Action::SetAdvisoryTypeFilter(Some(expected))
+        );
+        assert_eq!(app.list_query().as_deref(), Some("labels:type=cve|csaf"));
+    }
+
+    #[test]
+    fn purl_filter_edits_ecosystem_and_architecture_and_uses_purl_identity() {
+        let mut app = App::records(
+            serde_json::json!({
+                "items": [{
+                    "id": "internal-id",
+                    "uuid": "urn:uuid:123e4567-e89b-12d3-a456-426614174000",
+                    "purl": "pkg:npm/lodash@4.17.21",
+                    "type": "npm",
+                    "name": "lodash",
+                    "version": "4.17.21"
+                }]
+            }),
+            ListParams::default(),
+            20,
+            "PURLs",
+            ListResource::Package,
+        )
+        .expect("valid PURL page");
+
+        let columns = app.columns.as_ref().expect("PURL columns");
+        assert_eq!(columns.first().map(String::as_str), Some("purl"));
+        assert!(!columns.iter().any(|column| column == "uuid"));
+
+        assert_eq!(app.handle_key(KeyCode::Char('f')), Action::None);
+        assert_eq!(app.handle_key(KeyCode::Enter), Action::None);
+        for character in "npm".chars() {
+            assert_eq!(app.handle_key(KeyCode::Char(character)), Action::None);
+        }
+        assert_eq!(app.handle_key(KeyCode::Enter), Action::None);
+        assert_eq!(app.handle_key(KeyCode::Down), Action::None);
+        assert_eq!(app.handle_key(KeyCode::Enter), Action::None);
+        for character in "x86_64".chars() {
+            assert_eq!(app.handle_key(KeyCode::Char(character)), Action::None);
+        }
+        assert_eq!(app.handle_key(KeyCode::Enter), Action::None);
+
+        assert_eq!(
+            app.handle_key(KeyCode::Char('a')),
+            Action::SetPurlFilter(PurlFilter {
+                ecosystem: "npm".to_owned(),
+                architecture: "x86_64".to_owned(),
+                ..PurlFilter::default()
+            })
+        );
+        assert_eq!(app.list_query().as_deref(), Some("type=npm&arch=x86_64"));
+    }
+
+    #[test]
+    fn purl_filter_supports_distribution_repository_and_custom_qualifiers() {
+        let mut app = App::records(
+            serde_json::json!({"items": [{"purl": "pkg:rpm/fedora/curl@8.0"}]}),
+            ListParams::default(),
+            20,
+            "PURLs",
+            ListResource::Package,
+        )
+        .expect("valid PURL page");
+        app.purl_filter = PurlFilter {
+            ecosystem: "rpm".to_owned(),
+            architecture: "x86_64".to_owned(),
+            distribution: "fedora".to_owned(),
+            repository_url: "https://repo.example/packages?a=1&b=2".to_owned(),
+            custom_qualifier_name: "channel".to_owned(),
+            custom_qualifier_value: "stable".to_owned(),
+        };
+
+        assert_eq!(
+            app.list_query().as_deref(),
+            Some(
+                "type=rpm&arch=x86_64&distro=fedora&purl:qualifiers:repository_url=https://repo.example/packages?a\\=1\\&b\\=2&purl:qualifiers:channel=stable"
+            )
         );
     }
 
@@ -1389,7 +2300,37 @@ mod tests {
                 "severity".to_owned(),
                 "score".to_owned(),
                 "published".to_owned(),
-                "modified".to_owned()
+                "modified".to_owned(),
+                "known_exploit".to_owned()
+            ])
+        );
+    }
+
+    #[test]
+    fn product_rows_show_names_instead_of_uuids() {
+        let app = App::records(
+            serde_json::json!({
+                "items": [{
+                    "id": "internal-id",
+                    "uuid": "product-uuid",
+                    "name": "OpenJDK",
+                    "vendor": "Red Hat",
+                    "versions": ["17"]
+                }]
+            }),
+            ListParams::default(),
+            20,
+            "Products",
+            ListResource::Product,
+        )
+        .expect("valid product page");
+
+        assert_eq!(
+            app.columns,
+            Some(vec![
+                "name".to_owned(),
+                "vendor".to_owned(),
+                "versions".to_owned()
             ])
         );
     }
@@ -1419,7 +2360,8 @@ mod tests {
                 "severity".to_owned(),
                 "score".to_owned(),
                 "published".to_owned(),
-                "modified".to_owned()
+                "modified".to_owned(),
+                "known_exploit".to_owned()
             ])
         );
     }
@@ -1464,7 +2406,9 @@ mod tests {
             Some(vec![
                 "document_id".to_owned(),
                 "title".to_owned(),
-                "type".to_owned()
+                "type".to_owned(),
+                "severity".to_owned(),
+                "score".to_owned()
             ])
         );
     }

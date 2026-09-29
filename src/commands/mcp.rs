@@ -31,6 +31,7 @@ impl From<ListArgs> for ListParams {
             offset: args.offset,
             sort: args.sort,
             total: false,
+            advisories: false,
         }
     }
 }
