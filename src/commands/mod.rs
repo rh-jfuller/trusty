@@ -6,6 +6,7 @@ mod organization;
 mod package;
 mod product;
 mod sbom;
+mod scan;
 mod vulnerability;
 mod weakness;
 
@@ -45,6 +46,7 @@ impl From<&ListOptions> for ListParams {
             offset: options.offset,
             sort: options.sort.clone(),
             total: false,
+            advisories: false,
         }
     }
 }
@@ -64,7 +66,7 @@ pub async fn list_resource(
     output_options: &OutputOptions,
 ) -> anyhow::Result<()> {
     let mode = output_options.format.resolve()?;
-    let settings = if mode == OutputMode::Tui {
+    let mut settings = if mode == OutputMode::Tui {
         Some(AppSettings::load()?)
     } else {
         None
@@ -76,27 +78,33 @@ pub async fn list_resource(
             .map(|settings| settings.page_size)
             .unwrap_or(DEFAULT_PAGE_SIZE);
         params.limit = Some(params.limit.unwrap_or(default_page_size).max(1));
-        params.total = true;
+        params.total = resource != ListResource::Sbom;
         if params.sort.is_none() {
             params.sort = settings
                 .as_ref()
                 .and_then(|settings| settings.default_sort(resource))
                 .map(str::to_owned);
         }
+        params.advisories = false;
     }
-    let response = api::list_resource(client, resource, &params).await?;
+    let mut request_params = params.clone();
+    if resource == ListResource::Vulnerability {
+        if let Some(settings) = &settings {
+            settings.apply_default_severity_filter(&mut request_params);
+        }
+    }
+    let response = api::list_resource(client, resource, &request_params).await?;
 
     match mode {
         OutputMode::Json => output::print_json(&response)?,
         OutputMode::Tui => {
-            let theme = settings
-                .as_ref()
-                .map(|settings| settings.theme)
-                .unwrap_or_default();
+            let settings = settings
+                .as_mut()
+                .expect("TUI settings are loaded for TUI output");
             if resource == ListResource::Sbom {
-                output::tui::browse_sboms(client, params, response, theme).await?;
+                output::tui::browse_sboms(client, params, response, settings).await?;
             } else {
-                output::tui::browse_records(client, resource, title, params, response, theme)
+                output::tui::browse_records(client, resource, title, params, response, settings)
                     .await?;
             }
         }
@@ -131,14 +139,19 @@ pub async fn run_entity_list(
     client: &ApiClient,
     resource: ListResource,
     counts: &output::tui::EntityCountCache,
-    settings: &AppSettings,
+    settings: &mut AppSettings,
 ) -> anyhow::Result<()> {
     let cached_total = counts.total(resource);
+    let has_default_severity_filter = resource == ListResource::Vulnerability
+        && settings.remember_severity_filter
+        && settings.default_severity_filter().is_some();
     let page_size = settings.page_size.max(1);
     let params = ListParams {
         limit: Some(page_size),
         sort: settings.default_sort(resource).map(str::to_owned),
-        total: cached_total.is_none(),
+        total: resource != ListResource::Sbom
+            && (cached_total.is_none() || has_default_severity_filter),
+        advisories: false,
         ..ListParams::default()
     };
     let title = match resource {
@@ -147,23 +160,33 @@ pub async fn run_entity_list(
         ListResource::Exploit => "Exploits",
         ListResource::License => "Licenses",
         ListResource::Organization => "Organizations",
-        ListResource::Package => "Packages",
+        ListResource::Package => "PURLs",
         ListResource::Product => "Products",
         ListResource::Vulnerability => "Vulnerabilities",
         ListResource::Weakness => "Weaknesses",
     };
-    let mut response = api::list_resource(client, resource, &params).await?;
-    if let Some(total) = cached_total {
-        response["total"] = Value::from(total);
-    } else if let Some(total) = response.get("total").and_then(Value::as_u64) {
-        counts.set_total(resource, Some(total));
+    let mut request_params = params.clone();
+    if resource == ListResource::Vulnerability {
+        settings.apply_default_severity_filter(&mut request_params);
+    }
+    let mut response = api::list_resource(client, resource, &request_params).await?;
+    if !has_default_severity_filter {
+        if let Some(total) = cached_total {
+            response["total"] = Value::from(total);
+        } else if let Some(total) = response.get("total").and_then(Value::as_u64) {
+            counts.set_total(resource, Some(total));
+        }
     }
 
     if resource == ListResource::Sbom {
-        output::tui::browse_sboms(client, params, response, settings.theme).await
+        output::tui::browse_sboms(client, params, response, settings).await
     } else {
-        output::tui::browse_records(client, resource, title, params, response, settings.theme).await
+        output::tui::browse_records(client, resource, title, params, response, settings).await
     }
+}
+
+pub(crate) async fn run_scan_tui(client: &ApiClient) -> anyhow::Result<()> {
+    scan::run(client, None, scan::ScanFormat::Tui).await
 }
 
 #[derive(Debug, Subcommand)]
@@ -172,6 +195,16 @@ pub enum Commands {
     Sbom {
         #[command(subcommand)]
         command: sbom::SbomCommands,
+    },
+
+    /// Scan directories, SBOMs, container images, or components for vulnerabilities
+    Scan {
+        /// Scan target: dir:PATH, sbom:PATH, pkg:PURL, name:COMPONENT, registry:IMAGE, or oci-archive:PATH; optional with --format tui
+        target: Option<String>,
+
+        /// Output format
+        #[arg(long, value_enum, default_value = "text")]
+        format: scan::ScanFormat,
     },
 
     /// Browse and inspect vulnerabilities
@@ -232,6 +265,7 @@ impl Commands {
     pub async fn run(&self, client: &ApiClient) -> anyhow::Result<()> {
         match self {
             Self::Sbom { command } => command.run(client).await,
+            Self::Scan { target, format } => scan::run(client, target.as_deref(), *format).await,
             Self::Vuln { command } => command.run(client).await,
             Self::Advisory { command } => command.run(client).await,
             Self::Exploit { command } => command.run(client).await,

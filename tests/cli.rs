@@ -470,6 +470,246 @@ async fn package_search_uses_purl_endpoint() {
 }
 
 #[tokio::test]
+async fn scan_purl_posts_to_vulnerability_analysis_endpoint() {
+    let server = MockServer::start().await;
+    let purl = "pkg:cargo/serde@1.0.0";
+    let response = serde_json::json!({
+        (purl): {
+            "details": [{
+                "identifier": "CVE-2025-1234",
+                "title": "Example vulnerability",
+                "base_score": {"score": 8.1, "severity": "high"},
+                "purl_statuses": [{"status": "affected", "advisory": {"identifier": "RUSTSEC-2025-1"}, "scores": []}]
+            }],
+            "warnings": []
+        }
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/api/v3/vulnerability/analyze"))
+        .and(header("authorization", "Bearer test-token"))
+        .and(body_string_contains(purl))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = run_cli(&server, &["scan", purl]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(purl));
+    assert!(stdout.contains("CVE-2025-1234"));
+    assert!(stdout.contains("affected"));
+}
+
+#[tokio::test]
+async fn scan_component_name_resolves_purls_before_analysis() {
+    let server = MockServer::start().await;
+    let purl = "pkg:rpm/redhat/openssl@3.0.7";
+    let search_response = serde_json::json!({
+        "items": [{
+            "base": {
+                "purl": "pkg:rpm/redhat/openssl",
+                "uuid": "123e4567-e89b-12d3-a456-426614174000"
+            },
+            "purl": purl,
+            "qualifiers": {},
+            "uuid": "123e4567-e89b-12d3-a456-426614174001",
+            "version": {
+                "purl": purl,
+                "uuid": "123e4567-e89b-12d3-a456-426614174002",
+                "version": "3.0.7"
+            }
+        }],
+        "total": 1
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/api/v3/purl"))
+        .and(query_param("q", "name~openssl"))
+        .and(query_param("limit", "1000"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(search_response))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v3/vulnerability/analyze"))
+        .and(body_string_contains(purl))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = run_cli(&server, &["scan", "name:openssl", "--format", "json"]);
+    assert_json_output(
+        output,
+        serde_json::json!({
+            "target": "name:openssl",
+            "package_count": 1,
+            "analyzed_package_count": 1,
+            "packages": [{"purl": purl, "name": "openssl", "version": "3.0.7"}],
+            "analysis": {}
+        }),
+    );
+}
+
+#[tokio::test]
+async fn scan_sbom_extracts_cyclonedx_components() {
+    let server = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let sbom_path = directory.path().join("sbom.json");
+    let purl = "pkg:npm/%40acme/widget@4.2.0";
+    std::fs::write(
+        &sbom_path,
+        serde_json::to_vec(&serde_json::json!({
+            "bomFormat": "CycloneDX",
+            "components": [{"name": "@acme/widget", "version": "4.2.0", "purl": purl}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/api/v3/vulnerability/analyze"))
+        .and(body_string_contains(purl))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let target = format!("sbom:{}", sbom_path.display());
+    let output = run_cli(&server, &["scan", &target, "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout: Value = serde_json::from_slice(&output.stdout).expect("JSON output");
+    assert_eq!(stdout["package_count"], 1);
+    assert_eq!(stdout["analyzed_package_count"], 1);
+    assert_eq!(stdout["packages"][0]["purl"], purl);
+}
+
+#[tokio::test]
+async fn scan_directory_catalogs_cargo_lockfile_packages() {
+    let server = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let lockfile = directory.path().join("Cargo.lock");
+    std::fs::write(
+        &lockfile,
+        "[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+    )
+    .unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/api/v3/vulnerability/analyze"))
+        .and(body_string_contains("pkg:cargo/serde@1.0.0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let target = format!("dir:{}", directory.path().display());
+    let output = run_cli(&server, &["scan", &target, "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout: Value = serde_json::from_slice(&output.stdout).expect("JSON output");
+    assert_eq!(stdout["package_count"], 1);
+    assert_eq!(stdout["analyzed_package_count"], 1);
+    assert_eq!(stdout["packages"][0]["purl"], "pkg:cargo/serde@1.0.0");
+}
+
+#[tokio::test]
+async fn vulnerability_analysis_batches_large_purl_sets() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v3/vulnerability/analyze"))
+        .and(header("authorization", "Bearer test-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let client = ApiClient::new(&Config {
+        url: server.uri(),
+        token: Some("test-token".to_owned()),
+        issuer_url: None,
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .expect("valid API client");
+    let purls = (0..501)
+        .map(|index| format!("pkg:generic/package-{index}@1.0.0"))
+        .collect::<Vec<_>>();
+
+    let response = api::vulnerability::analyze(&client, &purls)
+        .await
+        .expect("all PURLs are analyzed");
+    assert_eq!(response, serde_json::json!({}));
+}
+
+#[tokio::test]
+async fn vulnerability_analysis_refreshes_expired_oauth_tokens() {
+    let server = MockServer::start().await;
+    let issuer_url = server.uri();
+    let token_endpoint = format!("{}/oauth/token", server.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "issuer": issuer_url.clone(),
+            "token_endpoint": token_endpoint
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(body_string_contains("grant_type=client_credentials"))
+        .respond_with(TokenSequence(AtomicUsize::new(0)))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v3/vulnerability/analyze"))
+        .and(header("authorization", "Bearer expired-token"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("expired"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v3/vulnerability/analyze"))
+        .and(header("authorization", "Bearer refreshed-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = ApiClient::new(&Config {
+        url: server.uri(),
+        token: None,
+        issuer_url: Some(issuer_url),
+        client_id: Some("test-client".to_owned()),
+        client_secret: Some("test-secret".to_owned()),
+    })
+    .await
+    .expect("valid OAuth API client");
+    let purls = vec!["pkg:cargo/serde@1.0.0".to_owned()];
+
+    api::vulnerability::analyze(&client, &purls)
+        .await
+        .expect("analysis retries with a refreshed token");
+}
+
+#[tokio::test]
 async fn package_purl_alias_and_resource_get_commands_are_available() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -847,6 +1087,7 @@ fn help_is_available_without_connection_configuration() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("sbom"));
+    assert!(stdout.contains("scan"));
     assert!(stdout.contains("vuln"));
     assert!(stdout.contains("advisory"));
     assert!(stdout.contains("license"));

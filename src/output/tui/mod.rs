@@ -1,7 +1,9 @@
 mod app;
 mod render;
+mod scan;
 mod theme;
 
+pub use scan::run_scan;
 pub use theme::ThemeMode;
 
 use std::{
@@ -20,7 +22,7 @@ use crossterm::{
         LeaveAlternateScreen,
     },
 };
-use futures_util::StreamExt;
+use futures_util::{stream, StreamExt};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
@@ -30,11 +32,11 @@ use ratatui::{
     Frame, Terminal,
 };
 use serde_json::Value;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch, Semaphore};
 
 use crate::{
     api::{self, sbom, ApiClient, ListParams, ListResource},
-    output::tui::app::{Action, App},
+    output::tui::app::{Action, App, KnownExploitStatus, SbomVulnerabilityCountStatus, Screen},
     settings::{AppSettings, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE},
 };
 
@@ -68,7 +70,7 @@ const MENU_ENTRIES: [MenuEntry; 9] = [
     },
     MenuEntry {
         resource: ListResource::Package,
-        title: "Packages / Components",
+        title: "PURLs",
         description: "Search Package URLs",
     },
     MenuEntry {
@@ -92,6 +94,12 @@ const MENU_ENTRIES: [MenuEntry; 9] = [
         description: "Browse vendors and issuers",
     },
 ];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MenuSelection {
+    Entity(ListResource),
+    Scan,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EntityCount {
@@ -211,6 +219,7 @@ enum MenuAction {
     None,
     Exit,
     Select(ListResource),
+    Scan,
     RefreshCounts,
     OpenSettings,
     SaveSettings,
@@ -262,8 +271,8 @@ impl MenuState {
                                     ));
                                 }
                             }
-                        } else {
-                            let resource = MENU_ENTRIES[self.settings_selected - 2].resource;
+                        } else if self.settings_selected >= 4 {
+                            let resource = MENU_ENTRIES[self.settings_selected - 4].resource;
                             settings.set_sort(resource, input);
                             self.settings_error = None;
                             return MenuAction::SaveSettings;
@@ -291,7 +300,7 @@ impl MenuState {
                     self.settings_selected = self.settings_selected.saturating_sub(1);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if self.settings_selected < MENU_ENTRIES.len() + 1 {
+                    if self.settings_selected < MENU_ENTRIES.len() + 3 {
                         self.settings_selected += 1;
                     }
                 }
@@ -299,8 +308,20 @@ impl MenuState {
                     settings.page_size = DEFAULT_PAGE_SIZE;
                     return MenuAction::SaveSettings;
                 }
-                KeyCode::Char('r') if self.settings_selected >= 2 => {
-                    let resource = MENU_ENTRIES[self.settings_selected - 2].resource;
+                KeyCode::Char('r') if self.settings_selected == 2 => {
+                    if !settings.preview_pane_open {
+                        settings.preview_pane_open = true;
+                        return MenuAction::SaveSettings;
+                    }
+                }
+                KeyCode::Char('r') if self.settings_selected == 3 => {
+                    if !settings.remember_severity_filter {
+                        settings.remember_severity_filter = true;
+                        return MenuAction::SaveSettings;
+                    }
+                }
+                KeyCode::Char('r') if self.settings_selected >= 4 => {
+                    let resource = MENU_ENTRIES[self.settings_selected - 4].resource;
                     settings.reset_sort(resource);
                     return MenuAction::SaveSettings;
                 }
@@ -320,8 +341,16 @@ impl MenuState {
                     self.settings_input = Some(settings.page_size.to_string());
                     self.settings_error = None;
                 }
+                KeyCode::Enter | KeyCode::Char(' ') if self.settings_selected == 2 => {
+                    settings.preview_pane_open = !settings.preview_pane_open;
+                    return MenuAction::SaveSettings;
+                }
+                KeyCode::Enter | KeyCode::Char(' ') if self.settings_selected == 3 => {
+                    settings.remember_severity_filter = !settings.remember_severity_filter;
+                    return MenuAction::SaveSettings;
+                }
                 KeyCode::Enter | KeyCode::Char(' ') => {
-                    let resource = MENU_ENTRIES[self.settings_selected - 2].resource;
+                    let resource = MENU_ENTRIES[self.settings_selected - 4].resource;
                     self.settings_input = Some(settings.sort_value(resource).to_owned());
                     self.settings_error = None;
                 }
@@ -342,7 +371,7 @@ impl MenuState {
                 MenuAction::None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.selected < MENU_ENTRIES.len() {
+                if self.selected < MENU_ENTRIES.len() + 1 {
                     self.selected += 1;
                 }
                 MenuAction::None
@@ -351,7 +380,8 @@ impl MenuState {
                 self.log_pane_open = !self.log_pane_open;
                 MenuAction::None
             }
-            KeyCode::Enter if self.selected == MENU_ENTRIES.len() => MenuAction::OpenSettings,
+            KeyCode::Enter if self.selected == MENU_ENTRIES.len() + 1 => MenuAction::OpenSettings,
+            KeyCode::Enter if self.selected == MENU_ENTRIES.len() => MenuAction::Scan,
             KeyCode::Enter => MenuAction::Select(MENU_ENTRIES[self.selected].resource),
             _ => MenuAction::None,
         }
@@ -364,7 +394,7 @@ pub async fn main_menu(
     client_updates: &mut watch::Receiver<Option<Result<ApiClient, String>>>,
     counts: &EntityCountCache,
     settings: &mut AppSettings,
-) -> anyhow::Result<Option<(ListResource, usize)>> {
+) -> anyhow::Result<Option<(MenuSelection, usize)>> {
     let mut count_updates = counts.subscribe();
     let mut client_ready = false;
     if let Some(client_result) = client_updates.borrow().clone() {
@@ -372,7 +402,7 @@ pub async fn main_menu(
         client_ready = true;
     }
     let mut menu = MenuState {
-        selected: selected.min(MENU_ENTRIES.len()),
+        selected: selected.min(MENU_ENTRIES.len() + 1),
         log_pane_open: crate::logging::debug_mode_enabled(),
         ..MenuState::default()
     };
@@ -426,7 +456,10 @@ pub async fn main_menu(
                 match menu.handle_key(key.code, settings) {
                     MenuAction::None => {}
                     MenuAction::Exit => return Ok(None),
-                    MenuAction::Select(resource) => return Ok(Some((resource, menu.selected))),
+                    MenuAction::Select(resource) => {
+                        return Ok(Some((MenuSelection::Entity(resource), menu.selected)))
+                    }
+                    MenuAction::Scan => return Ok(Some((MenuSelection::Scan, menu.selected))),
                     MenuAction::RefreshCounts => {
                         if let Some(Ok(client)) = client_updates.borrow().clone() {
                             start_entity_count_requests(&client, counts, true);
@@ -485,7 +518,7 @@ fn render_main_menu(
         Block::default().style(Style::default().bg(palette.background)),
         frame.area(),
     );
-    render::render_banner_with_target(frame, areas[0], "Select an entity", instance_label, theme);
+    render::render_banner_with_target(frame, areas[0], "Select an option", instance_label, theme);
 
     if menu.help_open {
         render::render_help_panel(
@@ -500,9 +533,10 @@ fn render_main_menu(
                 &[
                     "d           Select dark mode",
                     "l           Select light mode",
-                    "↑/↓         Select appearance, rows, or entity sort",
-                    "Enter       Toggle theme or edit selected value",
+                    "↑/↓         Select appearance, rows, preview, filter memory, or sort",
+                    "Enter       Toggle appearance/preview/filter memory or edit a sort",
                     "Rows        Enter a number from 1 to 1000",
+                    "Filter      Enter toggles remembering the severity selection",
                     "Sort        Blank disables; r resets built-in default",
                     "Esc/q       Return to the entity menu",
                     "h           Show or close this help",
@@ -510,7 +544,7 @@ fn render_main_menu(
             } else {
                 &[
                     "↑/↓ or j/k  Select an entity or settings",
-                    "Enter       Open the selected page",
+                    "Enter       Open the selected option",
                     "r           Refresh entity counts",
                     "l           Toggle debug logs",
                     "q/Esc       Exit the entity menu",
@@ -556,13 +590,25 @@ fn render_main_menu(
                 ]))
             })
             .collect::<Vec<_>>();
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(
+                "Scan",
+                Style::default()
+                    .fg(palette.accent_bright)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  ·  Scan a directory, SBOM, image, component, or PURL",
+                Style::default().fg(palette.muted),
+            ),
+        ])));
         items.push(ListItem::new(
             "Settings  ·  Appearance and display preferences",
         ));
         let list = List::new(items)
             .block(
                 Block::default()
-                    .title("Main entities")
+                    .title("Browse or scan")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(palette.border))
                     .style(Style::default().fg(palette.foreground).bg(palette.surface)),
@@ -610,24 +656,46 @@ pub async fn browse_sboms(
     client: &ApiClient,
     mut params: sbom::ListParams,
     first_page: Value,
-    theme: ThemeMode,
+    settings: &mut AppSettings,
 ) -> anyhow::Result<()> {
     let page_size = params.limit.unwrap_or(20).max(1);
     params.limit = Some(page_size);
     let mut app = App::new(first_page, params, page_size)?
         .with_instance_label(client.instance_label())
-        .with_theme(theme);
+        .with_theme(settings.theme);
+    app.preview_pane_open = settings.preview_pane_open;
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     execute!(io::stdout(), Clear(ClearType::All))?;
     let mut events = EventStream::new();
+    let sbom_vulnerability_slots = Arc::new(Semaphore::new(5));
+    let (sbom_vulnerability_tx, mut sbom_vulnerability_rx) =
+        mpsc::unbounded_channel::<(String, Result<Vec<Value>, String>)>();
 
     loop {
+        schedule_sbom_vulnerability_checks(
+            client,
+            &mut app,
+            &sbom_vulnerability_tx,
+            &sbom_vulnerability_slots,
+        );
         draw_frame(&mut terminal, |frame| render::render(frame, &app))?;
-        let Some(event) = events.next().await else {
-            break;
+        let event = tokio::select! {
+            event = events.next() => {
+                let Some(event) = event else {
+                    break;
+                };
+                event.context("reading terminal event")?
+            }
+            result = sbom_vulnerability_rx.recv() => {
+                let Some((sbom_id, result)) = result else {
+                    break;
+                };
+                app.set_sbom_vulnerability_result(sbom_id, result);
+                continue;
+            }
         };
-        match event.context("reading terminal event")? {
+        match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     break;
@@ -647,32 +715,63 @@ pub async fn browse_sboms(
                             }
                         }
                     }
+                    Action::BrowseSbomVulnerabilities(id) => {
+                        load_sbom_vulnerabilities(client, &mut app, &id, &mut terminal).await?;
+                    }
+                    Action::BrowseSbomPackages(id) => {
+                        load_sbom_package_page(client, &mut app, &id, 0, true, &mut terminal)
+                            .await?;
+                    }
+                    Action::LoadSbomPackagePage { sbom_id, offset } => {
+                        load_sbom_package_page(
+                            client,
+                            &mut app,
+                            &sbom_id,
+                            offset,
+                            false,
+                            &mut terminal,
+                        )
+                        .await?;
+                    }
                     Action::NextPage => {
                         let offset = app.offset.saturating_add(app.page_size);
-                        load_page(client, &mut app, offset, false, &mut terminal).await?;
+                        load_page(client, &mut app, offset, &mut terminal).await?;
                     }
                     Action::PreviousPage => {
                         let offset = app.offset.saturating_sub(app.page_size);
-                        load_page(client, &mut app, offset, false, &mut terminal).await?;
+                        load_page(client, &mut app, offset, &mut terminal).await?;
                     }
                     Action::Search(query) => {
                         app.params.query = query;
                         app.total = None;
-                        load_page(client, &mut app, 0, true, &mut terminal).await?;
+                        load_page(client, &mut app, 0, &mut terminal).await?;
                     }
                     Action::Sort(sort) => {
                         app.params.sort = sort;
-                        load_page(client, &mut app, 0, false, &mut terminal).await?;
+                        load_page(client, &mut app, 0, &mut terminal).await?;
                     }
                     Action::SetDateRange(date_range) => {
                         app.date_range = date_range;
                         app.total = None;
-                        load_page(client, &mut app, 0, true, &mut terminal).await?;
+                        load_page(client, &mut app, 0, &mut terminal).await?;
                     }
                     Action::SetSeverityFilter(severities) => {
                         app.severity_filter = severities;
                         app.total = None;
-                        load_page(client, &mut app, 0, true, &mut terminal).await?;
+                        load_page(client, &mut app, 0, &mut terminal).await?;
+                    }
+                    Action::SetAdvisoryTypeFilter(advisory_types) => {
+                        app.advisory_type_filter = advisory_types;
+                        app.total = None;
+                        load_page(client, &mut app, 0, &mut terminal).await?;
+                    }
+                    Action::SetPurlFilter(filter) => {
+                        app.purl_filter = filter;
+                        app.total = None;
+                        load_page(client, &mut app, 0, &mut terminal).await?;
+                    }
+                    Action::SetPreviewPaneOpen(open) => {
+                        persist_preview_pane_preference(settings, &mut app, open);
                     }
                     Action::BrowseCwes(cwes) => app.open_cwe_list(cwes),
                     Action::BrowseExploits(id) => {
@@ -715,30 +814,263 @@ pub async fn browse_sboms(
     Ok(())
 }
 
+fn schedule_sbom_vulnerability_checks(
+    client: &ApiClient,
+    app: &mut App,
+    results: &mpsc::UnboundedSender<(String, Result<Vec<Value>, String>)>,
+    slots: &Arc<Semaphore>,
+) {
+    let sbom_ids = app.pending_sbom_vulnerability_checks();
+    if sbom_ids.is_empty() {
+        return;
+    }
+    let client = client.clone();
+    let results = results.clone();
+    let slots = Arc::clone(slots);
+    tokio::spawn(async move {
+        let checks = stream::iter(sbom_ids)
+            .map(|sbom_id| {
+                let client = client.clone();
+                let slots = Arc::clone(&slots);
+                async move {
+                    let result = match slots.acquire_owned().await {
+                        Ok(_permit) => match api::sbom::advisories(&client, &sbom_id).await {
+                            Ok(response) => Ok(sbom_vulnerability_rows(response)),
+                            Err(error) => {
+                                tracing::debug!(%sbom_id, %error, "could not load SBOM vulnerabilities");
+                                Err(error.to_string())
+                            }
+                        },
+                        Err(error) => Err(error.to_string()),
+                    };
+                    (sbom_id, result)
+                }
+            })
+            .buffer_unordered(5);
+        tokio::pin!(checks);
+        while let Some(result) = checks.next().await {
+            if results.send(result).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+async fn load_sbom_vulnerabilities(
+    client: &ApiClient,
+    app: &mut App,
+    sbom_id: &str,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> anyhow::Result<()> {
+    if let Some(vulnerabilities) = app.sbom_vulnerabilities(sbom_id) {
+        app.open_sbom_vulnerability_list(sbom_id.to_owned(), vulnerabilities.to_vec());
+        return Ok(());
+    }
+    if app.sbom_vulnerability_counts.get(sbom_id) == Some(&SbomVulnerabilityCountStatus::Checking) {
+        app.status = "Vulnerability data is still loading for this SBOM".to_owned();
+        return Ok(());
+    }
+    app.status = format!("Loading vulnerabilities for SBOM {sbom_id}…");
+    draw_frame(terminal, |frame| render::render(frame, app))?;
+    match api::sbom::advisories(client, sbom_id).await {
+        Ok(response) => {
+            let vulnerabilities = sbom_vulnerability_rows(response);
+            app.set_sbom_vulnerability_result(sbom_id.to_owned(), Ok(vulnerabilities.clone()));
+            app.open_sbom_vulnerability_list(sbom_id.to_owned(), vulnerabilities);
+        }
+        Err(error) => {
+            app.set_sbom_vulnerability_result(sbom_id.to_owned(), Err(error.to_string()));
+            app.status = error.to_string();
+        }
+    }
+    Ok(())
+}
+
+async fn load_sbom_package_page(
+    client: &ApiClient,
+    app: &mut App,
+    sbom_id: &str,
+    offset: u32,
+    include_total: bool,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> anyhow::Result<()> {
+    app.status = format!("Loading packages for SBOM {sbom_id}…");
+    draw_frame(terminal, |frame| render::render(frame, app))?;
+    let page_size = app.page_size.max(1);
+    let params = ListParams {
+        limit: Some(page_size),
+        offset: Some(offset),
+        total: include_total,
+        ..ListParams::default()
+    };
+    match api::sbom::packages(client, sbom_id, &params).await {
+        Ok(response) => {
+            if matches!(
+                &app.screen,
+                Screen::Detail {
+                    resource: Some(ListResource::Sbom),
+                    ..
+                }
+            ) {
+                app.open_sbom_package_list(sbom_id.to_owned(), response, page_size)?;
+            } else if !app.set_sbom_package_page(response, offset)? {
+                app.status = "No more packages".to_owned();
+            }
+        }
+        Err(error) => app.status = error.to_string(),
+    }
+    Ok(())
+}
+
+fn sbom_vulnerability_rows(response: Value) -> Vec<Value> {
+    let advisories = response
+        .as_array()
+        .or_else(|| response.get("advisories").and_then(Value::as_array));
+    let Some(advisories) = advisories else {
+        return Vec::new();
+    };
+
+    let mut rows: Vec<Value> = Vec::new();
+    let mut row_by_identifier = HashMap::<String, usize>::new();
+    for advisory in advisories {
+        let head = advisory.get("head").unwrap_or(advisory);
+        let advisory_identifier = ["identifier", "document_id", "uuid"]
+            .iter()
+            .find_map(|field| head.get(*field).and_then(Value::as_str));
+        let Some(statuses) = advisory
+            .get("status")
+            .or_else(|| advisory.get("statuses"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+
+        for status in statuses {
+            let vulnerability = status.get("vulnerability").unwrap_or(status);
+            let Some(identifier) = vulnerability
+                .get("identifier")
+                .or_else(|| vulnerability.get("id"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let best_score = status
+                .get("scores")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .max_by(|left, right| {
+                    score_value(left)
+                        .unwrap_or(f64::NEG_INFINITY)
+                        .total_cmp(&score_value(right).unwrap_or(f64::NEG_INFINITY))
+                });
+            let packages = status
+                .get("packages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+
+            if let Some(index) = row_by_identifier.get(identifier).copied() {
+                if let Some(best_score) = best_score {
+                    let current_score = rows[index].get("score").and_then(Value::as_f64);
+                    if current_score.is_none_or(|current| {
+                        score_value(best_score).is_some_and(|score| score > current)
+                    }) {
+                        rows[index]["score"] =
+                            best_score.get("value").cloned().unwrap_or(Value::Null);
+                        rows[index]["severity"] =
+                            best_score.get("severity").cloned().unwrap_or(Value::Null);
+                    }
+                }
+                if let Some(existing_packages) = rows[index]
+                    .get_mut("packages")
+                    .and_then(Value::as_array_mut)
+                {
+                    for package in packages {
+                        if !existing_packages.contains(&package) {
+                            existing_packages.push(package);
+                        }
+                    }
+                }
+                if let Some(advisory_identifier) = advisory_identifier {
+                    let advisory_ids = rows[index]
+                        .get_mut("advisories")
+                        .and_then(Value::as_array_mut);
+                    if let Some(advisory_ids) = advisory_ids {
+                        let advisory_id = Value::String(advisory_identifier.to_owned());
+                        if !advisory_ids.contains(&advisory_id) {
+                            advisory_ids.push(advisory_id);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let row = serde_json::json!({
+                "identifier": identifier,
+                "title": vulnerability.get("title"),
+                "published": vulnerability.get("published"),
+                "severity": best_score.and_then(|score| score.get("severity")),
+                "score": best_score.and_then(|score| score.get("value")),
+                "status": status.get("status"),
+                "packages": packages,
+                "advisories": advisory_identifier.into_iter().collect::<Vec<_>>(),
+            });
+            row_by_identifier.insert(identifier.to_owned(), rows.len());
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+fn score_value(score: &Value) -> Option<f64> {
+    score.get("value").and_then(Value::as_f64)
+}
+
 pub async fn browse_records(
     client: &ApiClient,
     resource: ListResource,
     title: &str,
     mut params: ListParams,
     first_page: Value,
-    theme: ThemeMode,
+    settings: &mut AppSettings,
 ) -> anyhow::Result<()> {
     let page_size = params.limit.unwrap_or(20).max(1);
     params.limit = Some(page_size);
     let mut app = App::records(first_page, params, page_size, title, resource)?
         .with_instance_label(client.instance_label())
-        .with_theme(theme);
+        .with_theme(settings.theme);
+    app.preview_pane_open = settings.preview_pane_open;
+    if settings.remember_severity_filter && resource == ListResource::Vulnerability {
+        app.severity_filter = settings
+            .default_severity_filter()
+            .map(|severities| severities.to_vec());
+    }
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     execute!(io::stdout(), Clear(ClearType::All))?;
     let mut events = EventStream::new();
+    let (exploit_results_tx, mut exploit_results_rx) =
+        mpsc::unbounded_channel::<(String, KnownExploitStatus)>();
 
     loop {
+        schedule_known_exploit_checks(client, &mut app, &exploit_results_tx);
         draw_frame(&mut terminal, |frame| render::render(frame, &app))?;
-        let Some(event) = events.next().await else {
-            break;
+        let event = tokio::select! {
+            event = events.next() => {
+                let Some(event) = event else {
+                    break;
+                };
+                event.context("reading terminal event")?
+            }
+            result = exploit_results_rx.recv() => {
+                if let Some((cve_id, status)) = result {
+                    app.set_known_exploit_status(cve_id, status);
+                }
+                continue;
+            }
         };
-        match event.context("reading terminal event")? {
+        match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     break;
@@ -752,6 +1084,24 @@ pub async fn browse_records(
                         if let Some(item) = app.items.get(app.selected).cloned() {
                             app.open_details(item);
                         }
+                    }
+                    Action::BrowseSbomVulnerabilities(id) => {
+                        load_sbom_vulnerabilities(client, &mut app, &id, &mut terminal).await?;
+                    }
+                    Action::BrowseSbomPackages(id) => {
+                        load_sbom_package_page(client, &mut app, &id, 0, true, &mut terminal)
+                            .await?;
+                    }
+                    Action::LoadSbomPackagePage { sbom_id, offset } => {
+                        load_sbom_package_page(
+                            client,
+                            &mut app,
+                            &sbom_id,
+                            offset,
+                            false,
+                            &mut terminal,
+                        )
+                        .await?;
                     }
                     Action::NextPage => {
                         let offset = app.offset.saturating_add(app.page_size);
@@ -781,10 +1131,26 @@ pub async fn browse_records(
                             .await?;
                     }
                     Action::SetSeverityFilter(severities) => {
-                        app.severity_filter = severities;
+                        app.severity_filter = severities.clone();
                         app.total = None;
                         load_records_page(client, resource, &mut app, 0, true, &mut terminal)
                             .await?;
+                        persist_severity_filter_preference(settings, &mut app, severities);
+                    }
+                    Action::SetAdvisoryTypeFilter(advisory_types) => {
+                        app.advisory_type_filter = advisory_types;
+                        app.total = None;
+                        load_records_page(client, resource, &mut app, 0, true, &mut terminal)
+                            .await?;
+                    }
+                    Action::SetPurlFilter(filter) => {
+                        app.purl_filter = filter;
+                        app.total = None;
+                        load_records_page(client, resource, &mut app, 0, true, &mut terminal)
+                            .await?;
+                    }
+                    Action::SetPreviewPaneOpen(open) => {
+                        persist_preview_pane_preference(settings, &mut app, open);
                     }
                     Action::BrowseCwes(cwes) => app.open_cwe_list(cwes),
                     Action::BrowseExploits(id) => {
@@ -825,6 +1191,78 @@ pub async fn browse_records(
     }
 
     Ok(())
+}
+
+fn persist_preview_pane_preference(settings: &mut AppSettings, app: &mut App, open: bool) {
+    settings.preview_pane_open = open;
+    if let Err(error) = settings.save() {
+        app.status = format!("Could not save preview-pane preference: {error}");
+    }
+}
+
+fn persist_severity_filter_preference(
+    settings: &mut AppSettings,
+    app: &mut App,
+    severities: Option<Vec<String>>,
+) {
+    if !settings.remember_severity_filter {
+        return;
+    }
+    settings.set_default_severity_filter(severities);
+    if let Err(error) = settings.save() {
+        app.status = format!("Could not save severity filter: {error}");
+    }
+}
+
+fn schedule_known_exploit_checks(
+    client: &ApiClient,
+    app: &mut App,
+    results: &mpsc::UnboundedSender<(String, KnownExploitStatus)>,
+) {
+    let cve_ids = app.pending_known_exploit_checks();
+    if cve_ids.is_empty() {
+        return;
+    }
+
+    let client = client.clone();
+    let results = results.clone();
+    tokio::spawn(async move {
+        let checks = stream::iter(cve_ids)
+            .map(|cve_id| {
+                let client = client.clone();
+                async move {
+                    let params = ListParams {
+                        query: Some(format!("cve_id={cve_id}")),
+                        limit: Some(1),
+                        offset: Some(0),
+                        ..ListParams::default()
+                    };
+                    let presence =
+                        api::exploit::list(&client, &params)
+                            .await
+                            .ok()
+                            .and_then(|response| {
+                                response
+                                    .get("items")
+                                    .and_then(Value::as_array)
+                                    .map(|items| !items.is_empty())
+                            });
+                    let status = match presence {
+                        Some(true) => KnownExploitStatus::Present,
+                        Some(false) => KnownExploitStatus::Absent,
+                        None => KnownExploitStatus::Unavailable,
+                    };
+                    (cve_id, status)
+                }
+            })
+            .buffer_unordered(5);
+        tokio::pin!(checks);
+        while let Some(result) = checks.next().await {
+            if results.send(result).is_err() {
+                break;
+            }
+        }
+    });
 }
 
 pub async fn show_detail(item: Value) -> anyhow::Result<()> {
@@ -870,6 +1308,37 @@ async fn run_detail_viewer(mut app: App, client: Option<&ApiClient>) -> anyhow::
                 match app.handle_key(key.code) {
                     Action::Quit => break,
                     Action::Back => app.go_back(),
+                    Action::BrowseSbomVulnerabilities(id) => {
+                        if let Some(client) = client {
+                            load_sbom_vulnerabilities(client, &mut app, &id, &mut terminal).await?;
+                        } else {
+                            app.status =
+                                "No API client available to list SBOM vulnerabilities".to_owned();
+                        }
+                    }
+                    Action::BrowseSbomPackages(id) => {
+                        if let Some(client) = client {
+                            load_sbom_package_page(client, &mut app, &id, 0, true, &mut terminal)
+                                .await?;
+                        } else {
+                            app.status = "No API client available to list SBOM packages".to_owned();
+                        }
+                    }
+                    Action::LoadSbomPackagePage { sbom_id, offset } => {
+                        if let Some(client) = client {
+                            load_sbom_package_page(
+                                client,
+                                &mut app,
+                                &sbom_id,
+                                offset,
+                                false,
+                                &mut terminal,
+                            )
+                            .await?;
+                        } else {
+                            app.status = "No API client available to list SBOM packages".to_owned();
+                        }
+                    }
                     Action::BrowseCwes(cwes) => app.open_cwe_list(cwes),
                     Action::BrowseExploits(id) => {
                         if let Some(client) = client {
@@ -1077,6 +1546,7 @@ async fn load_records_page(
         offset: Some(offset),
         sort: app.params.sort.clone(),
         total: include_total,
+        advisories: app.params.advisories,
     };
     let response = match api::list_resource(client, resource, &params).await {
         Ok(response) => response,
@@ -1095,7 +1565,6 @@ async fn load_page(
     client: &ApiClient,
     app: &mut App,
     offset: u32,
-    include_total: bool,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> anyhow::Result<()> {
     app.status = "Loading page…".to_owned();
@@ -1106,7 +1575,8 @@ async fn load_page(
         limit: Some(app.page_size),
         offset: Some(offset),
         sort: app.params.sort.clone(),
-        total: include_total,
+        total: false,
+        advisories: false,
     };
     let response = match sbom::list(client, &params).await {
         Ok(response) => response,
@@ -1171,6 +1641,22 @@ mod tests {
     }
 
     #[test]
+    fn menu_scan_entry_opens_the_scan_flow() {
+        let mut menu = MenuState::default();
+        let mut settings = AppSettings::default();
+
+        for _ in 0..MENU_ENTRIES.len() {
+            menu.handle_key(KeyCode::Down, &mut settings);
+        }
+
+        assert_eq!(menu.selected, MENU_ENTRIES.len());
+        assert_eq!(
+            menu.handle_key(KeyCode::Enter, &mut settings),
+            MenuAction::Scan
+        );
+    }
+
+    #[test]
     fn main_menu_r_requests_entity_count_refresh() {
         let mut menu = MenuState::default();
         let mut settings = AppSettings::default();
@@ -1225,7 +1711,7 @@ mod tests {
             menu.handle_key(KeyCode::Down, &mut settings);
         }
 
-        assert_eq!(menu.selected, MENU_ENTRIES.len());
+        assert_eq!(menu.selected, MENU_ENTRIES.len() + 1);
         assert_eq!(
             menu.handle_key(KeyCode::Enter, &mut settings),
             MenuAction::OpenSettings
@@ -1252,7 +1738,7 @@ mod tests {
     fn settings_can_edit_and_disable_an_entity_default_sort() {
         let mut menu = MenuState {
             settings_open: true,
-            settings_selected: 2,
+            settings_selected: 4,
             settings_input: Some(String::new()),
             ..MenuState::default()
         };
@@ -1280,13 +1766,61 @@ mod tests {
             Some("published:desc")
         );
 
-        menu.settings_selected = 3;
+        menu.settings_selected = 5;
         menu.settings_input = Some(String::new());
         assert_eq!(
             menu.handle_key(KeyCode::Enter, &mut settings),
             MenuAction::SaveSettings
         );
         assert_eq!(settings.default_sort(ListResource::Vulnerability), None);
+    }
+
+    #[test]
+    fn settings_can_toggle_severity_filter_memory() {
+        let mut menu = MenuState {
+            settings_open: true,
+            settings_selected: 3,
+            ..MenuState::default()
+        };
+        let mut settings = AppSettings::default();
+
+        assert!(settings.remember_severity_filter);
+        assert_eq!(
+            menu.handle_key(KeyCode::Enter, &mut settings),
+            MenuAction::SaveSettings
+        );
+        assert!(!settings.remember_severity_filter);
+        assert_eq!(
+            menu.handle_key(KeyCode::Char('r'), &mut settings),
+            MenuAction::SaveSettings
+        );
+        assert!(settings.remember_severity_filter);
+    }
+
+    #[test]
+    fn settings_can_toggle_and_reset_preview_pane_visibility() {
+        let mut menu = MenuState {
+            settings_open: true,
+            settings_selected: 2,
+            ..MenuState::default()
+        };
+        let mut settings = AppSettings::default();
+
+        assert!(settings.preview_pane_open);
+        assert_eq!(
+            menu.handle_key(KeyCode::Enter, &mut settings),
+            MenuAction::SaveSettings
+        );
+        assert!(!settings.preview_pane_open);
+        assert_eq!(
+            menu.handle_key(KeyCode::Char('r'), &mut settings),
+            MenuAction::SaveSettings
+        );
+        assert!(settings.preview_pane_open);
+        assert_eq!(
+            menu.handle_key(KeyCode::Char('r'), &mut settings),
+            MenuAction::None
+        );
     }
 
     #[test]
@@ -1348,9 +1882,9 @@ mod tests {
     }
 
     #[test]
-    fn menu_selection_stays_within_available_entities() {
+    fn menu_selection_stays_within_available_options() {
         let mut menu = MenuState {
-            selected: MENU_ENTRIES.len(),
+            selected: MENU_ENTRIES.len() + 1,
             ..MenuState::default()
         };
         let mut settings = AppSettings::default();
@@ -1359,12 +1893,12 @@ mod tests {
             menu.handle_key(KeyCode::Down, &mut settings),
             MenuAction::None
         );
-        assert_eq!(menu.selected, MENU_ENTRIES.len());
+        assert_eq!(menu.selected, MENU_ENTRIES.len() + 1);
         assert_eq!(
             menu.handle_key(KeyCode::Up, &mut settings),
             MenuAction::None
         );
-        assert_eq!(menu.selected, MENU_ENTRIES.len() - 1);
+        assert_eq!(menu.selected, MENU_ENTRIES.len());
     }
 
     #[test]
@@ -1380,6 +1914,46 @@ mod tests {
                 "missing TUI menu entry for {resource:?}"
             );
         }
+    }
+
+    #[test]
+    fn sbom_advisory_statuses_are_flattened_and_deduplicated_by_vulnerability() {
+        let vulnerabilities = sbom_vulnerability_rows(serde_json::json!([
+            {
+                "head": {"identifier": "ADV-1"},
+                "status": [{
+                    "status": "affected",
+                    "vulnerability": {
+                        "identifier": "CVE-2025-1234",
+                        "title": "Example vulnerability"
+                    },
+                    "scores": [{"severity": "medium", "value": 5.5}],
+                    "packages": [{"purl": "pkg:rpm/redhat/openssl@1"}]
+                }]
+            },
+            {
+                "head": {"identifier": "ADV-2"},
+                "status": [{
+                    "status": "affected",
+                    "vulnerability": {
+                        "identifier": "CVE-2025-1234",
+                        "title": "Example vulnerability"
+                    },
+                    "scores": [{"severity": "high", "value": 8.1}],
+                    "packages": [{"purl": "pkg:rpm/redhat/openssl@2"}]
+                }]
+            }
+        ]));
+
+        assert_eq!(vulnerabilities.len(), 1);
+        assert_eq!(vulnerabilities[0]["identifier"], "CVE-2025-1234");
+        assert_eq!(vulnerabilities[0]["score"], 8.1);
+        assert_eq!(vulnerabilities[0]["severity"], "high");
+        assert_eq!(vulnerabilities[0]["packages"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            vulnerabilities[0]["advisories"].as_array().unwrap().len(),
+            2
+        );
     }
 
     #[test]

@@ -48,7 +48,7 @@ async fn run_entity_menu(config: &Config) -> anyhow::Result<()> {
     let counts = output::tui::EntityCountCache::default();
     let mut selected = 0;
     let instance_label = ApiClient::configured_instance_label(&config.url);
-    while let Some((resource, new_selection)) = output::tui::main_menu(
+    while let Some((selection, new_selection)) = output::tui::main_menu(
         selected,
         &instance_label,
         &mut client_updates,
@@ -66,7 +66,12 @@ async fn run_entity_menu(config: &Config) -> anyhow::Result<()> {
                 anyhow::anyhow!("API client initialization task ended unexpectedly")
             })?;
         };
-        commands::run_entity_list(&client, resource, &counts, &settings).await?;
+        match selection {
+            output::tui::MenuSelection::Entity(resource) => {
+                commands::run_entity_list(&client, resource, &counts, &mut settings).await?;
+            }
+            output::tui::MenuSelection::Scan => commands::run_scan_tui(&client).await?,
+        }
     }
     drop(client_sender);
     Ok(())

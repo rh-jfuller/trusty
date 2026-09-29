@@ -27,13 +27,14 @@ pub enum ListResource {
     Weakness,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ListParams {
     pub query: Option<String>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
     pub sort: Option<String>,
     pub total: bool,
+    pub advisories: bool,
 }
 
 pub async fn list_resource(

@@ -15,6 +15,7 @@ use crate::{
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const ANALYSIS_BATCH_SIZE: usize = 500;
 
 #[derive(Clone, Copy)]
 enum TokenEndpointAuthMethod {
@@ -205,6 +206,7 @@ impl ApiClient {
         let offset = params.offset;
         let sort = params.sort.clone();
         let total = params.total;
+        let advisories = params.advisories;
 
         self.send_with_refresh(move || {
             let api = api.clone();
@@ -227,6 +229,9 @@ impl ApiClient {
                 if total {
                     request = request.total(true);
                 }
+                if advisories {
+                    request = request.advisories(true);
+                }
                 request.send().await
             }
         })
@@ -244,6 +249,75 @@ impl ApiClient {
             async move { api.get_sbom().id(id).send().await }
         })
         .await
+    }
+
+    pub async fn analyze_vulnerabilities(&self, purls: &[String]) -> Result<Value, ApiError> {
+        if purls.is_empty() {
+            return Ok(Value::Object(serde_json::Map::new()));
+        }
+
+        let mut endpoint = self.api_url.clone();
+        endpoint
+            .path_segments_mut()
+            .map_err(|_| {
+                ApiError::InvalidConfiguration("API URL cannot be used as a base URL".to_owned())
+            })?
+            .pop_if_empty()
+            .extend(["vulnerability", "analyze"]);
+
+        let mut combined = serde_json::Map::new();
+        for batch in purls.chunks(ANALYSIS_BATCH_SIZE) {
+            let body = serde_json::json!({ "purls": batch });
+            let mut token_refreshed = false;
+            loop {
+                let token = match &self.token {
+                    Some(token) => token.read().await.clone(),
+                    None => None,
+                };
+                let mut request = self
+                    .http
+                    .post(endpoint.clone())
+                    .timeout(Duration::from_secs(120))
+                    .json(&body);
+                if let Some(token) = token {
+                    request = request.bearer_auth(token);
+                }
+
+                let response = request.send().await?;
+                let status = response.status();
+                let response_body = response.bytes().await?;
+                if status == StatusCode::UNAUTHORIZED && !token_refreshed {
+                    if let Some(oauth) = &self.oauth {
+                        tracing::warn!(
+                            "Trustify rejected the access token; refreshing OAuth credentials"
+                        );
+                        let token = get_token(&self.http, oauth).await?;
+                        if let Some(token_state) = &self.token {
+                            *token_state.write().await = Some(token);
+                        }
+                        token_refreshed = true;
+                        continue;
+                    }
+                }
+                if !status.is_success() {
+                    return Err(ApiError::HttpStatus {
+                        status,
+                        body: String::from_utf8_lossy(&response_body).into_owned(),
+                    });
+                }
+
+                let value: Value = serde_json::from_slice(&response_body)?;
+                let Some(items) = value.as_object() else {
+                    return Err(ApiError::Client(
+                        "vulnerability analysis response must be a JSON object".to_owned(),
+                    ));
+                };
+                combined.extend(items.clone());
+                break;
+            }
+        }
+
+        Ok(Value::Object(combined))
     }
 
     pub(crate) fn generated_api(&self) -> trustify_client::api::Client {

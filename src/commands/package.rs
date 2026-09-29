@@ -30,7 +30,7 @@ impl PackageCommands {
     pub async fn run(&self, client: &ApiClient) -> anyhow::Result<()> {
         match self {
             Self::Search { options, output } => {
-                commands::list_resource(client, ListResource::Package, "Packages", options, output)
+                commands::list_resource(client, ListResource::Package, "PURLs", options, output)
                     .await?;
             }
             Self::Get { key, output } => {
